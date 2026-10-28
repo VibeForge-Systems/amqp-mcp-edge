@@ -286,11 +286,11 @@ The initial test surface should verify:
 6. mock-broker round trips without importing MCP transport code
 
 **Relevant starting sources**
-- `https://github.com/nagual69/AMQPConnectorforMCP/tree/main/src/transports/amqp-client-transport.ts` - reuse connection lifecycle and client-side recovery ideas, not MCP message semantics.
-- `https://github.com/nagual69/AMQPConnectorforMCP/tree/main/src/transports/amqp-server-transport.ts` - reuse broker/channel management patterns and validation discipline, not request/response routing behavior.
-- `https://github.com/nagual69/AMQPConnectorforMCP/tree/main/src/transports/amqp-utils.ts` - strong starting point for shared validation, routing helpers, config parsing, and message size checks.
-- `https://github.com/nagual69/AMQPConnectorforMCP/tree/main/src/transports/__tests__/transport.test.ts` - strong starting point for mocked broker tests and flow verification.
-- `https://github.com/nagual69/AMQPConnectorforMCP/tree/main/AUDIT.md` - preserve the lessons already learned about transport contract clarity, recovery, validation, and application-logic separation.
+- `https://github.com/VibeForge-Systems/amqp-mcp-transport/tree/main/src/transports/amqp-client-transport.ts` - reuse connection lifecycle and client-side recovery ideas, not MCP message semantics.
+- `https://github.com/VibeForge-Systems/amqp-mcp-transport/tree/main/src/transports/amqp-server-transport.ts` - reuse broker/channel management patterns and validation discipline, not request/response routing behavior.
+- `https://github.com/VibeForge-Systems/amqp-mcp-transport/tree/main/src/transports/amqp-utils.ts` - strong starting point for shared validation, routing helpers, config parsing, and message size checks.
+- `https://github.com/VibeForge-Systems/amqp-mcp-transport/tree/main/src/transports/__tests__/transport.test.ts` - strong starting point for mocked broker tests and flow verification.
+- `https://github.com/VibeForge-Systems/amqp-mcp-transport/tree/main/AUDIT.md` - preserve the lessons already learned about transport contract clarity, recovery, validation, and application-logic separation.
 
 **Verification**
 
