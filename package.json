@@ -6,11 +6,11 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nagual69/AMQPConnectorforMCPEdge.git"
+    "url": "git+https://github.com/VibeForge-Systems/amqp-mcp-edge.git"
   },
-  "homepage": "https://github.com/nagual69/AMQPConnectorforMCPEdge#readme",
+  "homepage": "https://github.com/VibeForge-Systems/amqp-mcp-edge#readme",
   "bugs": {
-    "url": "https://github.com/nagual69/AMQPConnectorforMCPEdge/issues"
+    "url": "https://github.com/VibeForge-Systems/amqp-mcp-edge/issues"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

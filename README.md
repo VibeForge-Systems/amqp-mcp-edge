@@ -208,7 +208,7 @@ console.log(mock.publishedEvents);        // inspect published events
 ### Getting started
 
 ```bash
-git clone https://github.com/nagual69/AMQPConnectorforMCPEdge.git
+git clone https://github.com/VibeForge-Systems/amqp-mcp-edge.git
 cd AMQPConnectorforMCPEdge
 npm install
 npm run build
