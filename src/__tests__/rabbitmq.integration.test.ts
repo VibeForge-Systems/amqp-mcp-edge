@@ -223,7 +223,7 @@ test('live RabbitMQ integration publishes job lifecycle events end to end', { ti
         nodeId: harness.nodeId,
       },
       createdBy: {
-        controlPlane: 'mcp-od-marketplace',
+        controlPlane: 'example-control-plane',
       },
       capability: {
         kind: 'tool',
@@ -372,7 +372,7 @@ test('live RabbitMQ integration requeues after nack and publishes failure before
         nodeId: harness.nodeId,
       },
       createdBy: {
-        controlPlane: 'mcp-od-marketplace',
+        controlPlane: 'example-control-plane',
       },
       capability: {
         kind: 'tool',

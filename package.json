@@ -1,7 +1,8 @@
 {
-  "name": "@nagual69/amqp-mcp-edge",
+  "name": "@vibeforge-systems/amqp-mcp-edge",
   "version": "0.1.0",
-  "description": "Reusable AMQP edge execution library for MCP worker deployments",
+  "description": "Typed AMQP execution channel for MCP edge workers: versioned job and event contracts, RabbitMQ consumer and publisher primitives, and an in-memory test double",
+  "author": "VibeForge Systems, Inc. (https://www.vibeforgesystems.com/)",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -52,7 +53,9 @@
     "dist",
     "README.md",
     "CHANGELOG.md",
-    "docs/RELEASE_POLICY.md"
+    "docs/RELEASE_POLICY.md",
+    "LICENSE",
+    "docs/PROTOCOL.md"
   ],
   "publishConfig": {
     "access": "public",
@@ -75,10 +78,16 @@
     "release:check": "npm run test:all && npm pack --dry-run"
   },
   "keywords": [
-    "amqp",
     "mcp",
+    "model-context-protocol",
+    "amqp",
+    "rabbitmq",
     "edge",
-    "workers"
+    "workers",
+    "job-queue",
+    "message-queue",
+    "typescript",
+    "ai-agents"
   ],
   "dependencies": {
     "amqplib": "^0.10.8",
@@ -88,5 +97,8 @@
     "@types/amqplib": "^0.10.7",
     "@types/node": "^22.0.0",
     "typescript": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

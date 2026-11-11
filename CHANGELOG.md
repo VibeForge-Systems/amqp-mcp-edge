@@ -2,7 +2,8 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on Keep a Changelog and this project follows Semantic Versioning.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
+follows [Semantic Versioning](https://semver.org/). Version 0.1.0 has not been published yet.
 
 ## [Unreleased]
 
@@ -18,13 +19,15 @@ The format is based on Keep a Changelog and this project follows Semantic Versio
 
 ### Changed
 
-- package identity updated to scoped name `@nagual69/amqp-mcp-edge`
+- package published under the VibeForge Systems npm scope, as `@vibeforge-systems/amqp-mcp-edge`
+- Node.js 22 or later is required (`engines.node`)
+- the wire protocol is documented in `docs/PROTOCOL.md`; internal planning documents were removed
 - production build now excludes test compilation outputs from published `dist`
 - added reconnect and channel re-initialization workflow in connection lifecycle
 - runtime compatibility checks are now enforced by consumer and publisher paths
 - publisher now waits for channel drain when AMQP backpressure is signaled
 
-## [0.1.0] - 2026-03-22
+## [0.1.0] - unreleased
 
 ### Added
 

@@ -37,7 +37,7 @@ export function createExecutionJob(overrides: Partial<ExecutionJobEnvelope> = {}
         nodeId: 'node-1',
       },
       createdBy: {
-        controlPlane: 'mcp-od-marketplace',
+        controlPlane: 'example-control-plane',
       },
       capability: {
         kind: 'tool',

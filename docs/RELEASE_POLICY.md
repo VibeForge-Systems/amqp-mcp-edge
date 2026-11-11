@@ -2,7 +2,7 @@
 
 ## Package Scope
 
-`@nagual69/amqp-mcp-edge` is a reusable AMQP execution-channel library for MCP edge workers. It is versioned and released independently from any single MCP server or control plane.
+`@vibeforge-systems/amqp-mcp-edge` is a reusable AMQP execution-channel library for MCP edge workers. It is versioned and released independently from any single MCP server or control plane.
 
 ## Versioning Rules
 
@@ -44,5 +44,5 @@ Recommended first-publish flow:
 ## Compatibility Notes
 
 - Public message contracts must remain transport-agnostic and must not adopt JSON-RPC or reply-queue semantics.
-- Routing namespaces must remain separate from `AMQPConnectorforMCP` namespaces.
+- Routing namespaces must remain separate from the [amqp-mcp-transport](https://github.com/VibeForge-Systems/amqp-mcp-transport) namespaces.
 - Control-plane-specific behavior must stay outside this package.
