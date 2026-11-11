@@ -1,0 +1,9 @@
+# REUSE (https://reuse.software) metadata: every file's copyright and license, in one place,
+# so `reuse lint` can prove the whole tree is covered.
+version = 1
+
+[[annotations]]
+path = "**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 VibeForge Systems, Inc."
+SPDX-License-Identifier = "MIT"
