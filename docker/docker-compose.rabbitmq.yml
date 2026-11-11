@@ -1,6 +1,6 @@
 services:
   rabbitmq:
-    image: rabbitmq:3.13-management
+    image: rabbitmq:4-management
     container_name: amqp-mcp-edge-rabbitmq
     ports:
       - "5672:5672"

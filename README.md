@@ -219,6 +219,9 @@ runtime still has gaps that matter for production use. They will be closed befor
   failures.
 - **Dead-letter exchange is declared but not bound.** Jobs rejected with `requeue: false` are
   dropped unless you bind your own queue to `mcp.edge.dlx`.
+- **RabbitMQ 4.x refuses transient non-exclusive queues.** The default consumer queue is durable
+  and unaffected. If you pass `consumerQueueOptions` with `durable: false`, also set
+  `exclusive: true`; otherwise the broker closes the connection on declare.
 - **Reconnect is connection-level.** Channel-only closures are not handled, and deliveries
   received before a reconnect cannot be acknowledged afterwards (the broker redelivers them).
 

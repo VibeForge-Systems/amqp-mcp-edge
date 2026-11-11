@@ -18,6 +18,8 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A hung broker connection must fail the job in minutes, not hold a runner for six hours.
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:

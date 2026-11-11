@@ -98,14 +98,35 @@ async function createHarness(prefix: string): Promise<IntegrationHarness> {
   const consumerQueueName = `mcp.edge.consumer.${siteId}.${nodeId}.${runId}`;
   const controlQueueName = `mcp.edge.control.${siteId}.${nodeId}.${runId}`;
   const { connection: controlConnection, amqpUrl } = await connectToBroker();
+  // The broker closes the connection on a refused declare; without a listener that 'error' event
+  // is an uncaught exception instead of a test failure.
+  controlConnection.on('error', () => undefined);
+  try {
+    return await declareHarness(controlConnection, amqpUrl, {
+      runId, siteId, nodeId, jobsExchange, eventsExchange, deadLetterExchange, consumerQueueName, controlQueueName,
+    });
+  } catch (error) {
+    await controlConnection.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function declareHarness(
+  controlConnection: ChannelModel,
+  amqpUrl: string,
+  names: Omit<IntegrationHarness, 'amqpUrl' | 'controlConnection' | 'controlChannel'>,
+): Promise<IntegrationHarness> {
+  const { runId, siteId, nodeId, jobsExchange, eventsExchange, deadLetterExchange, consumerQueueName, controlQueueName } = names;
   const controlChannel = await controlConnection.createChannel();
 
   await controlChannel.assertExchange(jobsExchange, 'topic', { durable: true });
   await controlChannel.assertExchange(eventsExchange, 'topic', { durable: true });
   await controlChannel.assertExchange(deadLetterExchange, 'topic', { durable: true });
+  // Exclusive, not durable:false + autoDelete: RabbitMQ 4.x refuses transient non-exclusive queues
+  // (deprecated feature transient_nonexcl_queues). An exclusive queue is deleted with its connection.
   await controlChannel.assertQueue(controlQueueName, {
     durable: false,
-    autoDelete: true,
+    exclusive: true,
   });
   await controlChannel.bindQueue(
     controlQueueName,
@@ -134,8 +155,9 @@ async function destroyHarness(harness: IntegrationHarness): Promise<void> {
   await harness.controlConnection.close().catch(() => undefined);
 }
 
-test('live RabbitMQ integration publishes job lifecycle events end to end', { timeout: 20000 }, async () => {
+test('live RabbitMQ integration publishes job lifecycle events end to end', { timeout: 20000 }, async (t) => {
   const harness = await createHarness('success');
+  t.after(() => destroyHarness(harness));
 
   const edgeChannel = await createEdgeChannel({
     amqpUrl: harness.amqpUrl,
@@ -149,11 +171,12 @@ test('live RabbitMQ integration publishes job lifecycle events end to end', { ti
     consumerQueueName: harness.consumerQueueName,
     consumerQueueOptions: {
       durable: false,
-      autoDelete: true,
+      exclusive: true,
     },
     prefetchCount: 1,
     connectionName: `amqp-mcp-edge-integration-${harness.runId}`,
   });
+  t.after(() => edgeChannel.close().catch(() => undefined));
 
   const ackPromise = waitForMessage(harness.controlChannel, harness.controlQueueName, 15000);
   const progressPromise = waitForMessage(harness.controlChannel, harness.controlQueueName, 15000);
@@ -260,13 +283,11 @@ test('live RabbitMQ integration publishes job lifecycle events end to end', { ti
   assert.equal(progressEnvelope.messageType, 'execution.progress');
   assert.equal(resultEnvelope.messageType, 'execution.result');
   assert.equal(resultEnvelope.payload.jobId, jobEnvelope.payload.jobId);
-
-  await edgeChannel.close();
-  await destroyHarness(harness);
 });
 
-test('live RabbitMQ integration requeues after nack and publishes failure before success', { timeout: 20000 }, async () => {
+test('live RabbitMQ integration requeues after nack and publishes failure before success', { timeout: 20000 }, async (t) => {
   const harness = await createHarness('requeue');
+  t.after(() => destroyHarness(harness));
   const edgeChannel = await createEdgeChannel({
     amqpUrl: harness.amqpUrl,
     siteId: harness.siteId,
@@ -279,11 +300,12 @@ test('live RabbitMQ integration requeues after nack and publishes failure before
     consumerQueueName: harness.consumerQueueName,
     consumerQueueOptions: {
       durable: false,
-      autoDelete: true,
+      exclusive: true,
     },
     prefetchCount: 1,
     connectionName: `amqp-mcp-edge-requeue-${harness.runId}`,
   });
+  t.after(() => edgeChannel.close().catch(() => undefined));
 
   const failurePromise = waitForMessage(harness.controlChannel, harness.controlQueueName, 15000);
   const ackPromise = waitForMessage(harness.controlChannel, harness.controlQueueName, 15000);
@@ -412,7 +434,4 @@ test('live RabbitMQ integration requeues after nack and publishes failure before
   assert.equal(deliveries[0]?.redelivered, false);
   assert.equal(deliveries[1]?.redelivered, true);
   assert.equal(resultEnvelope.payload.output.recovered, true);
-
-  await edgeChannel.close();
-  await destroyHarness(harness);
 });

@@ -52,7 +52,8 @@ async function main() {
   await controlChannel.assertExchange(jobsExchange, 'topic', { durable: true });
   await controlChannel.assertExchange(eventsExchange, 'topic', { durable: true });
   await controlChannel.assertExchange(deadLetterExchange, 'topic', { durable: true });
-  await controlChannel.assertQueue(controlQueueName, { durable: false, autoDelete: true });
+  // Exclusive: RabbitMQ 4.x refuses transient non-exclusive queues.
+  await controlChannel.assertQueue(controlQueueName, { durable: false, exclusive: true });
   await controlChannel.bindQueue(controlQueueName, eventsExchange, `edge.event.*.${siteId}.${nodeId}`);
 
   const edgeChannel = await createEdgeChannel({
@@ -65,7 +66,7 @@ async function main() {
     consumerQueueName: workerQueueName,
     consumerQueueOptions: {
       durable: false,
-      autoDelete: true,
+      exclusive: true,
     },
     connectionName: `amqp-mcp-edge-example-${runId}`,
   });

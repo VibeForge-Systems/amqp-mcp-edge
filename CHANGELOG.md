@@ -22,6 +22,10 @@ follows [Semantic Versioning](https://semver.org/). Version 0.1.0 has not been p
 - package published under the VibeForge Systems npm scope, as `@vibeforge-systems/amqp-mcp-edge`
 - Node.js 22 or later is required (`engines.node`)
 - the wire protocol is documented in `docs/PROTOCOL.md`; internal planning documents were removed
+- the integration tests and the end-to-end example declare exclusive queues, so they run on
+  RabbitMQ 4.x, which refuses transient non-exclusive queues; a failed test setup now closes its
+  broker connection instead of leaving the test process running
+- local docker compose and CI use RabbitMQ 4
 - production build now excludes test compilation outputs from published `dist`
 - added reconnect and channel re-initialization workflow in connection lifecycle
 - runtime compatibility checks are now enforced by consumer and publisher paths
