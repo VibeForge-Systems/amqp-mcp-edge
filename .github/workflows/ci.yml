@@ -30,6 +30,8 @@ jobs:
         image: rabbitmq:4-management
         ports:
           - 5672:5672
+          # The management API: the least-privilege integration tests create a vhost and a user.
+          - 15672:15672
         env:
           RABBITMQ_DEFAULT_USER: mcp
           RABBITMQ_DEFAULT_PASS: discovery
@@ -55,4 +57,8 @@ jobs:
       - run: npm run test:integration
         env:
           AMQP_INTEGRATION_URL: amqp://mcp:discovery@127.0.0.1:5672
+          # The management credentials default to those of AMQP_INTEGRATION_URL.
+          AMQP_INTEGRATION_MANAGEMENT_URL: http://127.0.0.1:15672
+          # Fail, rather than skip, the least-privilege tests if the management API is unreachable.
+          AMQP_INTEGRATION_REQUIRE_MANAGEMENT: '1'
       - run: npm pack --dry-run

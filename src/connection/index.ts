@@ -1,4 +1,5 @@
 import type { EdgeChannelConfig } from '../config/index.js';
+import { resolveConfig } from '../config/index.js';
 import { EdgeJobConsumer } from '../consumer/index.js';
 import { EdgeEventPublisher } from '../publisher/index.js';
 
@@ -20,12 +21,30 @@ export interface EdgeChannel {
   close(): Promise<void>;
 }
 
+/**
+ * Connects to the broker and returns a consumer and publisher that share the connection.
+ *
+ * With `topologyMode: 'passive'` it checks that the consumer queue and the events exchange exist
+ * before returning, and rejects with an `EdgeTopologyError` naming the first one that is missing.
+ * It then closes the connection, so a failed startup leaves no reconnect loop running.
+ */
 export async function createEdgeChannel(config: EdgeChannelConfig): Promise<EdgeChannel> {
   const connectionManager = new EdgeChannelConnectionManager(config);
-  await connectionManager.connect();
-
+  // Constructing these validates the config, before a connection is opened.
   const consumer = new EdgeJobConsumer(config, connectionManager);
   const publisher = new EdgeEventPublisher(config, connectionManager);
+
+  await connectionManager.connect();
+
+  if (resolveConfig(config).topologyMode === 'passive') {
+    try {
+      await consumer.verifyTopology();
+      await publisher.verifyTopology();
+    } catch (error) {
+      await connectionManager.close();
+      throw error;
+    }
+  }
 
   return {
     consumer,
@@ -38,3 +57,4 @@ export async function createEdgeChannel(config: EdgeChannelConfig): Promise<Edge
 }
 
 export { EdgeChannelConnectionManager } from './connection-manager.js';
+export { EdgeTopologyError } from '../topology/index.js';

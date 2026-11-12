@@ -72,6 +72,25 @@ export class EdgeChannelConnectionManager {
     return this.publisherChannel;
   }
 
+  /**
+   * Opens a short-lived channel for passive topology checks; the caller closes it.
+   *
+   * A failed check makes the broker close the channel it ran on. The 'error' listener keeps that
+   * failure on this channel: amqplib treats an unhandled channel 'error' as a frame error and
+   * closes the whole connection, which would start the reconnect loop over a missing exchange.
+   */
+  public async openTopologyChannel(): Promise<Channel> {
+    await this.connect();
+
+    if (!this.connection) {
+      throw new Error('connection is not available');
+    }
+
+    const channel = await this.connection.createChannel();
+    channel.on('error', () => undefined);
+    return channel;
+  }
+
   public async close(): Promise<void> {
     this.closedByUser = true;
     this.connected = false;
@@ -173,8 +192,24 @@ export class EdgeChannelConnectionManager {
   }
 
   private async notifyReconnectSubscribers(): Promise<void> {
+    // Every subscriber runs, even after one fails, so that one component's failure does not leave
+    // another holding state from the previous connection.
+    let firstError: unknown;
+    let failed = false;
+
     for (const subscriber of this.reconnectSubscribers) {
-      await subscriber();
+      try {
+        await subscriber();
+      } catch (error) {
+        if (!failed) {
+          firstError = error;
+          failed = true;
+        }
+      }
+    }
+
+    if (failed) {
+      throw firstError;
     }
   }
 
