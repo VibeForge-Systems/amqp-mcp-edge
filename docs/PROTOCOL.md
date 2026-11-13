@@ -182,8 +182,9 @@ Each is an RFC 3339 date-time, and the validators accept only this form:
 - **The offset is `Z` or `±hh:mm`**, as in `2026-11-12T10:00:00+05:30`. An offset is required.
 - **`T` and `Z` are upper-case.**
 - **Rejected:** minute precision (`2026-11-12T10:00Z`), an offset without the colon
-  (`2026-11-12T10:00:00+0530`), an hours-only offset (`2026-11-12T10:00:00+05`), and a time with no
-  offset (`2026-11-12T10:00:00`).
+  (`2026-11-12T10:00:00+0530`), an hours-only offset (`2026-11-12T10:00:00+05`), a time with no
+  offset (`2026-11-12T10:00:00`), lower-case `t` or `z`, and a leap second
+  (`2026-11-12T10:00:60Z`), which RFC 3339 allows but the validators do not.
 
 JavaScript's `new Date().toISOString()` produces a valid value, and so does Python's
 `datetime.now(timezone.utc).isoformat()`. A job with an invalid timestamp fails validation, and the

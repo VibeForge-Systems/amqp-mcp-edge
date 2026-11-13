@@ -291,6 +291,9 @@ const timestampCases: Array<[value: string, accepted: boolean]> = [
   ['2026-11-12T10:00Z', false], // minute precision
   ['2026-11-12T10:00:00+0530', false], // offset without the colon
   ['2026-11-12T10:00:00+05', false], // hours-only offset
+  ['2026-11-12T10:00:00', false], // no offset
+  ['2026-11-12t10:00:00z', false], // lower-case t and z
+  ['2026-11-12T10:00:60Z', false], // leap second
 ];
 
 test('validateEnvelope accepts RFC 3339 timestamps with seconds and a Z or ±hh:mm offset, and nothing looser', () => {

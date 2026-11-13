@@ -45,6 +45,10 @@ follows [Semantic Versioning](https://semver.org/). Version 0.1.0 has not been p
   an event carrying one.
   `new Date().toISOString()` output is unaffected. `docs/PROTOCOL.md` documents the format, and
   unit tests pin it
+- **Contract:** the integer fields (`payload.timeoutMs`, `payload.attempt.attemptNumber` and
+  `payload.attempt.maxAttempts`) must be safe integers, and progress `metrics` values must be
+  finite numbers. zod 3 accepted integers above `Number.MAX_SAFE_INTEGER` and `Infinity`. JSON
+  cannot carry `Infinity`, so that half affects only events built in process
 - validation errors from `validateEnvelope` and `assertCompatibleEnvelope` keep their
   `invalid <messageType> envelope:` prefix, but the issue text after it is now zod 4's (for
   example `invalid_format` and `Invalid ISO datetime` where zod 3 gave `invalid_string` and
