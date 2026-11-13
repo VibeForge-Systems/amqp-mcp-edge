@@ -1,7 +1,7 @@
 import type { Channel, Options } from 'amqplib';
 
 import type { EdgeChannelConfig } from '../config/index.js';
-import { buildRoutingKey, resolveConfig, validateConfig } from '../config/index.js';
+import { buildRoutingKey, resolveConfig, resolveUserId, validateConfig } from '../config/index.js';
 import {
   assertCompatibleEnvelope,
   type JobAckMessage,
@@ -11,6 +11,7 @@ import {
 } from '../contracts/index.js';
 import type { EdgeChannelConnectionManager } from '../connection/connection-manager.js';
 import { createHealthSnapshot, type EdgeChannelHealth } from '../health/index.js';
+import { checkTopology } from '../topology/index.js';
 
 export interface EdgeEventPublisher {
   publishAck(message: JobAckMessage): Promise<void>;
@@ -29,6 +30,10 @@ export class EdgeEventPublisher implements EdgeEventPublisher {
 
   private publisherActive = false;
 
+  private readonly userId: string;
+
+  private topologyVerification?: Promise<void>;
+
   public constructor(config: EdgeChannelConfig, connectionManager: EdgeChannelConnectionManager) {
     const validationErrors = validateConfig(config);
 
@@ -37,7 +42,32 @@ export class EdgeEventPublisher implements EdgeEventPublisher {
     }
 
     this.config = resolveConfig(config);
+    this.userId = resolveUserId(config);
     this.connectionManager = connectionManager;
+    connectionManager.onReconnect(async () => {
+      // Check the events exchange again, once, on the new connection.
+      this.topologyVerification = undefined;
+    });
+  }
+
+  /**
+   * Checks, without declaring anything, that the events exchange exists. In passive mode the first
+   * publish calls it, and `createEdgeChannel` calls it before returning. A success is cached until
+   * the next reconnect, so publishes do not repeat the check; a failure is not cached.
+   */
+  public async verifyTopology(): Promise<void> {
+    if (!this.topologyVerification) {
+      const verification = this.checkPublisherTopology().catch((error: unknown) => {
+        if (this.topologyVerification === verification) {
+          this.topologyVerification = undefined;
+        }
+
+        throw error;
+      });
+      this.topologyVerification = verification;
+    }
+
+    await this.topologyVerification;
   }
 
   public async publishAck(message: JobAckMessage): Promise<void> {
@@ -77,8 +107,15 @@ export class EdgeEventPublisher implements EdgeEventPublisher {
       throw new Error('publisher only accepts execution events');
     }
 
+    if (this.config.topologyMode === 'passive') {
+      await this.verifyTopology();
+    }
+
     const channel = await this.connectionManager.getPublisherChannel();
-    await channel.assertExchange(this.config.eventsExchange, 'topic', { durable: true });
+
+    if (this.config.topologyMode === 'declare') {
+      await channel.assertExchange(this.config.eventsExchange, 'topic', { durable: true });
+    }
 
     const routingKey = this.resolveRoutingKey(validatedMessage);
     const content = Buffer.from(JSON.stringify(validatedMessage), 'utf8');
@@ -88,6 +125,9 @@ export class EdgeEventPublisher implements EdgeEventPublisher {
       type: validatedMessage.messageType,
       messageId: validatedMessage.messageId,
       timestamp: Date.parse(validatedMessage.timestamp),
+      // The node's identity. The broker refuses a user_id that differs from the connection's user,
+      // which is what lets the control plane trust it; see "Node identity" in docs/PROTOCOL.md.
+      userId: this.userId,
     };
 
     const accepted = channel.publish(this.config.eventsExchange, routingKey, content, publishOptions);
@@ -97,6 +137,11 @@ export class EdgeEventPublisher implements EdgeEventPublisher {
     }
 
     this.publisherActive = true;
+  }
+
+  private async checkPublisherTopology(): Promise<void> {
+    const channel = await this.connectionManager.openTopologyChannel();
+    await checkTopology(channel, [{ kind: 'exchange', name: this.config.eventsExchange }]);
   }
 
   private resolveRoutingKey(message: PublishableEvent): string {

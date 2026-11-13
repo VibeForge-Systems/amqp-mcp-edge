@@ -1,5 +1,5 @@
 import type { EdgeChannelConfig } from '../config/index.js';
-import { buildRoutingKey, resolveConfig } from '../config/index.js';
+import { buildRoutingKey, resolveConfig, resolveUserId } from '../config/index.js';
 import { validateEnvelope, type ExecutionJobEnvelope, type JobAckMessage, type JobFailureEvent, type JobProgressEvent, type JobResultEvent } from '../contracts/index.js';
 import { createHealthSnapshot, type EdgeChannelHealth } from '../health/index.js';
 import type { EdgeChannel } from '../connection/index.js';
@@ -9,6 +9,8 @@ type EdgeEventEnvelope = JobAckMessage | JobProgressEvent | JobResultEvent | Job
 
 export interface MockPublishedEvent {
   routingKey: string;
+  /** The AMQP `user_id` the real publisher would set: the node's broker username. */
+  userId: string;
   message: EdgeEventEnvelope;
 }
 
@@ -124,12 +126,15 @@ class MockEdgeJobConsumer {
 class MockEdgeEventPublisher {
   private readonly config;
 
+  private readonly userId: string;
+
   private readonly publishedEvents: MockPublishedEvent[] = [];
 
   private active = false;
 
   public constructor(config: EdgeChannelConfig) {
     this.config = resolveConfig(config);
+    this.userId = resolveUserId(config);
   }
 
   public async publishAck(message: JobAckMessage): Promise<void> {
@@ -175,6 +180,7 @@ class MockEdgeEventPublisher {
         siteId: validatedEnvelope.payload.siteId ?? this.config.siteId,
         nodeId: validatedEnvelope.payload.nodeId,
       }),
+      userId: this.userId,
       message: validatedEnvelope,
     });
   }

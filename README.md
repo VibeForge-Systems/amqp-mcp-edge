@@ -68,8 +68,10 @@ share a broker.
 | **Typed contracts** | Versioned envelopes for jobs, acks, progress, results and failures |
 | **Runtime validation** | Inbound and outbound envelopes are validated at the boundary |
 | **Compatibility checks** | Rejects jobs whose `minConsumerVersion` the worker does not meet |
-| **Consumer primitive** | Job consumer with automatic queue binding and re-initialization after a connection drop |
+| **Consumer primitive** | Job consumer that declares and binds its queue, or in passive mode only checks it, and re-subscribes after a connection drop |
 | **Publisher primitive** | Event publisher that waits for channel drain under backpressure |
+| **Node identity** | Every event carries the broker-validated AMQP `user_id` of the node |
+| **Least privilege** | Passive topology mode: a node runs without the configure permission |
 | **Routing helpers** | Deterministic routing keys and queue names for edge execution traffic |
 | **Health snapshots** | Structured connection and channel health for monitoring endpoints |
 | **Testing helpers** | In-memory mock edge channel for fast, broker-free unit tests |
@@ -108,6 +110,8 @@ const channel = await createEdgeChannel({
   nodeId: 'node-1',
   // Jobs that set compatibility.minConsumerVersion are rejected unless this is set.
   runtimeConsumerVersion: '0.1.0',
+  // Declares its own topology, which suits a local broker. In production, use
+  // topologyMode: 'passive' (see Configuration).
 });
 
 channel.consumer.onJob(async (job, delivery) => {
@@ -134,6 +138,71 @@ channel.consumer.onJob(async (job, delivery) => {
 
 await channel.consumer.start();
 ```
+
+---
+
+## Configuration
+
+`createEdgeChannel`, `EdgeJobConsumer` and `EdgeEventPublisher` take the same `EdgeChannelConfig`.
+
+| Option | Default | Description |
+|:---|:---|:---|
+| `amqpUrl` | required | Broker URL (`amqp://` or `amqps://`) with the node's credentials and vhost |
+| `topologyMode` | `'declare'` | `'declare'`: declare the exchanges, the consumer queue and its bindings, which needs the configure permission. `'passive'`: declare nothing; check that the consumer queue and the events exchange exist, and fail with an `EdgeTopologyError` naming any that is missing. **Use `'passive'` in production.** |
+| `userId` | username in `amqpUrl` | Broker username sent as the AMQP `user_id` of every event; the broker refuses an event whose `user_id` is not the connection's user. Defaults to the URL-decoded username in `amqpUrl`, or `guest` (amqplib's default) when the URL has no credentials. Set it only if the username cannot be read from `amqpUrl` |
+| `siteId` | — | Site segment of the queue name and routing keys |
+| `nodeId` | — | Node segment of the queue name and routing keys |
+| `nodeGroup` | — | Group whose jobs the node also takes |
+| `jobsExchange` | `mcp.edge.jobs` | Exchange jobs arrive on |
+| `eventsExchange` | `mcp.edge.events` | Exchange events are published to |
+| `deadLetterExchange` | `mcp.edge.dlx` | The consumer queue's `x-dead-letter-exchange`, in declare mode |
+| `consumerQueueName` | `mcp.edge.consumer.<siteId>.<nodeId>` | The queue the node consumes |
+| `queueNamingStrategy` | built in | Computes the queue name when `consumerQueueName` is not set |
+| `consumerQueueOptions` | `{ durable: true }` | Queue declaration options, in declare mode; ignored in passive mode |
+| `consumerTag` | assigned by the broker | Consumer tag for the subscription |
+| `prefetchCount` | `1` | Unacknowledged jobs the broker delivers at a time |
+| `maxMessageSizeBytes` | `1048576` | Larger jobs are rejected without requeue |
+| `runtimeConsumerVersion` | — | Checked against a job's `compatibility.minConsumerVersion` |
+| `runtimeProducerVersion` | — | Checked against an event's `compatibility.minProducerVersion` |
+| `connectionName` | `amqp-mcp-edge` | Connection name shown by the broker |
+| `reconnectEnabled` | `true` | Reconnect after the connection drops |
+| `reconnectDelayMs` | `1000` | First reconnect delay; doubles after each failed attempt |
+| `reconnectMaxDelayMs` | `30000` | Upper bound of the reconnect delay |
+| `backpressureTimeoutMs` | `5000` | How long a publish waits for the channel to drain |
+| `routingKeyStrategy` | — | Accepted, but not applied yet: events use the default routing keys |
+
+### Production settings
+
+```ts
+const channel = await createEdgeChannel({
+  // The node's own broker user; '@' in a username is written %40.
+  amqpUrl: 'amqps://node-1%40site-a:<password>@broker.example.com/edge',
+  siteId: 'site-a',
+  nodeId: 'node-1',
+  topologyMode: 'passive',
+  runtimeConsumerVersion: '0.1.0',
+  runtimeProducerVersion: '0.1.0',
+});
+```
+
+- **`topologyMode: 'passive'`.** The control plane declares the exchanges, the node's queue and
+  its bindings, and the dead-letter queue, as [docs/PROTOCOL.md](docs/PROTOCOL.md#broker-topology)
+  lists. The node only checks, once at startup and once after each reconnect, that its queue and
+  the events exchange exist. `createEdgeChannel` rejects with an `EdgeTopologyError` naming a
+  missing one, closes its connection, and creates nothing.
+- **One broker user per node, without configure.** The permission set is in
+  [docs/PROTOCOL.md](docs/PROTOCOL.md#least-privilege-permissions): configure `^$`, read on the
+  node's queue, write on `mcp.edge.events`, and topic write limited to the node's routing keys.
+  The configure permission that declare mode needs would also let a node delete the shared
+  exchanges every other node depends on.
+- **The URL's username is the node's identity.** It is sent as `user_id` on every event, and the
+  broker refuses an event whose `user_id` is not the authenticated user. Consumers of
+  `mcp.edge.events` must reject events that lack it
+  ([Node identity](docs/PROTOCOL.md#node-identity)).
+- **`amqps://`** for any broker not on the same host or a trusted private network.
+
+`'declare'` remains the default in 0.x, for backward compatibility and local development against
+a broker you own.
 
 ---
 
@@ -217,13 +286,17 @@ runtime still has gaps that matter for production use. They will be closed befor
 - **A throwing job handler requeues indefinitely.** There is no retry limit or poison-message
   handling yet; handle errors inside your handler and `nack` with `requeue: false` for permanent
   failures.
-- **Dead-letter exchange is declared but not bound.** Jobs rejected with `requeue: false` are
-  dropped unless you bind your own queue to `mcp.edge.dlx`.
+- **Declare mode does not bind the dead-letter exchange.** It declares `mcp.edge.dlx` and sets it
+  as the queue's dead-letter exchange, but jobs rejected with `requeue: false` are dropped unless
+  you bind a queue to it. In passive mode the control plane declares that queue
+  ([Broker topology](docs/PROTOCOL.md#broker-topology)).
 - **RabbitMQ 4.x refuses transient non-exclusive queues.** The default consumer queue is durable
   and unaffected. If you pass `consumerQueueOptions` with `durable: false`, also set
   `exclusive: true`; otherwise the broker closes the connection on declare.
 - **Reconnect is connection-level.** Channel-only closures are not handled, and deliveries
-  received before a reconnect cannot be acknowledged afterwards (the broker redelivers them).
+  received before a reconnect cannot be acknowledged afterwards (the broker redelivers them). In
+  passive mode, a consumer whose queue disappeared while it was disconnected stops, and `health()`
+  reports `consumerActive: false` with the reason in `details.topologyError`; it does not retry.
 
 ---
 
@@ -299,6 +372,24 @@ The integration suite covers:
 
 - Full job lifecycle (dispatch → ack → progress → result)
 - Failure + requeue behavior via `nack(..., { requeue: true })`
+- Passive topology: a missing queue or events exchange fails startup with an `EdgeTopologyError`,
+  creates nothing, and leaves no reconnect loop running
+- Least privilege: a passive-mode worker whose user has configure `^$`, read on its own queue and
+  write on `mcp.edge.events` runs jobs end to end, and its rejected jobs reach the dead-letter queue
+- The same user's attempts to delete `mcp.edge.jobs` and `mcp.edge.events`, or to redeclare or
+  rebind the topology, are refused with `ACCESS_REFUSED`
+- Every event carries the node's `user_id`, and an event with a forged `user_id` closes the
+  channel with `PRECONDITION_FAILED`
+- After the broker drops the connection, a passive consumer whose queue has gone stops and
+  reports why, with no reconnect loop, while the publisher keeps working
+
+The least-privilege tests create a vhost and a broker user through the RabbitMQ management API,
+then delete them. By default they use port 15672 on the broker host (the docker compose file
+publishes it) with the credentials of the AMQP URL, which must belong to an administrator.
+`AMQP_INTEGRATION_MANAGEMENT_URL`, `AMQP_INTEGRATION_MANAGEMENT_USERNAME` and
+`AMQP_INTEGRATION_MANAGEMENT_PASSWORD` override them. Without the management API those tests are
+skipped, with the reason; `AMQP_INTEGRATION_REQUIRE_MANAGEMENT=1` makes them fail instead, as CI
+does.
 
 ### End-to-end example
 
@@ -324,6 +415,7 @@ src/
 ├── health/          # Structured health snapshots
 ├── publisher/       # EdgeEventPublisher — event publishing with backpressure
 ├── testing/         # In-memory mock edge channel
+├── topology/        # Passive topology checks and EdgeTopologyError
 └── __tests__/       # Unit and integration test suites
 ```
 

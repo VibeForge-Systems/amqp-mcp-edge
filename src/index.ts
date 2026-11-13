@@ -4,18 +4,25 @@ export type {
   QueueNamingStrategy,
   RoutingKeySelector,
   RoutingKeyStrategy,
+  TopologyMode,
 } from './config/index.js';
 export {
   buildConsumerQueueName,
   buildJobBindingKeys,
   buildJobRoutingKey,
   buildRoutingKey,
+  defaultAmqpUsername,
   defaultExchangeConfig,
   defaultQueueNamingStrategy,
   defaultRoutingKeyStrategy,
   resolveConfig,
+  resolveUserId,
+  topologyModes,
   validateConfig,
 } from './config/index.js';
+
+export type { TopologyEntity, TopologyEntityKind } from './topology/index.js';
+export { EdgeTopologyError } from './topology/index.js';
 
 export type {
   BaseEdgeEnvelope,

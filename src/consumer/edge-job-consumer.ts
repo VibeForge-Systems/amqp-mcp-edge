@@ -5,6 +5,7 @@ import { buildConsumerQueueName, buildJobBindingKeys, resolveConfig, validateCon
 import { assertCompatibleEnvelope, type ExecutionJobEnvelope } from '../contracts/index.js';
 import type { EdgeChannelConnectionManager } from '../connection/connection-manager.js';
 import { createHealthSnapshot, type EdgeChannelHealth } from '../health/index.js';
+import { checkTopology, EdgeTopologyError } from '../topology/index.js';
 
 export interface JobDeliveryContext {
   deliveryTag?: number;
@@ -36,6 +37,10 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
 
   private consumerTag?: string;
 
+  private topologyVerification?: Promise<void>;
+
+  private topologyError?: EdgeTopologyError;
+
   public constructor(config: EdgeChannelConfig, connectionManager: EdgeChannelConnectionManager) {
     const validationErrors = validateConfig(config);
 
@@ -46,11 +51,28 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
     this.config = resolveConfig(config);
     this.connectionManager = connectionManager;
     connectionManager.onReconnect(async () => {
+      // A new connection may reach a broker whose topology changed while this node was away, so a
+      // passive-mode consumer checks its queue again, once, before it subscribes.
+      this.topologyVerification = undefined;
+
       if (!this.consumerActive) {
         return;
       }
 
-      await this.initializeConsumer();
+      try {
+        await this.initializeConsumer();
+      } catch (error) {
+        if (!(error instanceof EdgeTopologyError)) {
+          throw error;
+        }
+
+        // The check failed on its own channel, so the connection is still up and nothing else
+        // reconnects. Stop consuming instead of retrying: restoring the topology is the control
+        // plane's job, not this node's. health() reports the reason.
+        this.consumerActive = false;
+        this.consumerTag = undefined;
+        this.pendingDeliveries.clear();
+      }
     });
   }
 
@@ -106,33 +128,64 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
       publisherActive: connectionHealth.publisherActive,
       details: {
         pendingDeliveries: this.pendingDeliveries.size,
+        ...(this.topologyError ? { topologyError: this.topologyError.message } : {}),
       },
     });
   }
 
+  /**
+   * Checks, without declaring anything, that the consumer queue exists. In passive mode `start()`
+   * calls it, and `createEdgeChannel` calls it before returning. A success is cached until the next
+   * reconnect; a failure is not, so a later call checks again.
+   *
+   * Only the queue is checked. The jobs and dead-letter exchanges are reached through bindings and
+   * the queue's dead-letter argument, both owned by the control plane, and RabbitMQ 4 refuses a
+   * passive check of an exchange the node holds no permission on.
+   */
+  public async verifyTopology(): Promise<void> {
+    if (!this.topologyVerification) {
+      const verification = this.checkConsumerTopology().then(
+        () => {
+          this.topologyError = undefined;
+        },
+        (error: unknown) => {
+          if (this.topologyVerification === verification) {
+            this.topologyVerification = undefined;
+          }
+
+          if (error instanceof EdgeTopologyError) {
+            this.topologyError = error;
+          }
+
+          throw error;
+        },
+      );
+      this.topologyVerification = verification;
+    }
+
+    await this.topologyVerification;
+  }
+
+  private async checkConsumerTopology(): Promise<void> {
+    const channel = await this.connectionManager.openTopologyChannel();
+    await checkTopology(channel, [{ kind: 'queue', name: buildConsumerQueueName(this.config) }]);
+  }
+
   private async initializeConsumer(): Promise<void> {
     const existingTag = this.consumerTag;
+    const queueName = buildConsumerQueueName(this.config);
+
+    if (this.config.topologyMode === 'passive') {
+      await this.verifyTopology();
+    }
 
     const channel = await this.connectionManager.getConsumerChannel();
-    await channel.assertExchange(this.config.jobsExchange, 'topic', { durable: true });
-    await channel.assertExchange(this.config.deadLetterExchange, 'topic', { durable: true });
-    await channel.prefetch(this.config.prefetchCount);
 
-    const queueName = buildConsumerQueueName(this.config);
-    const queueOptions: Options.AssertQueue = {
-      durable: true,
-      ...this.config.consumerQueueOptions,
-      arguments: {
-        ...(this.config.consumerQueueOptions?.arguments ?? {}),
-        'x-dead-letter-exchange': this.config.deadLetterExchange,
-      },
-    };
-
-    await channel.assertQueue(queueName, queueOptions);
-
-    for (const bindingKey of buildJobBindingKeys(this.config)) {
-      await channel.bindQueue(queueName, this.config.jobsExchange, bindingKey);
+    if (this.config.topologyMode === 'declare') {
+      await this.declareTopology(channel, queueName);
     }
+
+    await channel.prefetch(this.config.prefetchCount);
 
     const consumeResult = await channel.consume(
       queueName,
@@ -149,6 +202,26 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
     }
 
     this.consumerTag = consumeResult.consumerTag;
+  }
+
+  private async declareTopology(channel: Channel, queueName: string): Promise<void> {
+    await channel.assertExchange(this.config.jobsExchange, 'topic', { durable: true });
+    await channel.assertExchange(this.config.deadLetterExchange, 'topic', { durable: true });
+
+    const queueOptions: Options.AssertQueue = {
+      durable: true,
+      ...this.config.consumerQueueOptions,
+      arguments: {
+        ...(this.config.consumerQueueOptions?.arguments ?? {}),
+        'x-dead-letter-exchange': this.config.deadLetterExchange,
+      },
+    };
+
+    await channel.assertQueue(queueName, queueOptions);
+
+    for (const bindingKey of buildJobBindingKeys(this.config)) {
+      await channel.bindQueue(queueName, this.config.jobsExchange, bindingKey);
+    }
   }
 
   private async handleMessage(channel: Channel, message: ConsumeMessage | null): Promise<void> {
