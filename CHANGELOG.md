@@ -35,6 +35,20 @@ follows [Semantic Versioning](https://semver.org/). Version 0.1.0 has not been p
 
 ### Changed
 
+- `zod` is now `^4.6.7` (was `^3.25.64`), still a regular dependency. The range admits no 4.x
+  release before 4.5, the first to reject minute-precision timestamps
+- **Contract:** the timestamp fields (`timestamp`, `payload.attempt.firstAttemptAt`,
+  `payload.attempt.previousAttemptAt`, `payload.completedAt` and `payload.failedAt`) must be an
+  RFC 3339 date-time with seconds and a `Z` or `±hh:mm` offset. Minute precision
+  (`2026-11-12T10:00Z`) and an offset without the colon (`+0530`), which zod 3 accepted, are now
+  rejected: the consumer rejects a job carrying one without requeue, and the publisher refuses
+  an event carrying one.
+  `new Date().toISOString()` output is unaffected. `docs/PROTOCOL.md` documents the format, and
+  unit tests pin it
+- validation errors from `validateEnvelope` and `assertCompatibleEnvelope` keep their
+  `invalid <messageType> envelope:` prefix, but the issue text after it is now zod 4's (for
+  example `invalid_format` and `Invalid ISO datetime` where zod 3 gave `invalid_string` and
+  `Invalid datetime`). Match on the prefix, not on the issue text
 - **Contract:** consumers of `mcp.edge.events` must reject events without `user_id`. Events from
   earlier builds of this library carry none, so upgrade edge nodes before enforcing the rule
 - `createEdgeChannel` validates the config before it connects, so an invalid config no longer

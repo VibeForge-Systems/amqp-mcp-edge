@@ -164,6 +164,32 @@ export interface JobFailurePayload {
 export type JobFailureEvent = BaseEdgeEnvelope<'execution.failure', JobFailurePayload>;
 ```
 
+## Timestamp Format
+
+These fields hold timestamps:
+
+| Field | Where |
+|:---|:---|
+| `timestamp` | every envelope |
+| `payload.attempt.firstAttemptAt`, `payload.attempt.previousAttemptAt` | `execution.job`, optional |
+| `payload.completedAt` | `execution.result` |
+| `payload.failedAt` | `execution.failure` |
+
+Each is an RFC 3339 date-time, and the validators accept only this form:
+
+- **Seconds are required.** Any number of fractional-second digits may follow them:
+  `2026-11-12T10:00:00Z` and `2026-11-12T10:00:00.123456Z` are both valid.
+- **The offset is `Z` or `±hh:mm`**, as in `2026-11-12T10:00:00+05:30`. An offset is required.
+- **`T` and `Z` are upper-case.**
+- **Rejected:** minute precision (`2026-11-12T10:00Z`), an offset without the colon
+  (`2026-11-12T10:00:00+0530`), an hours-only offset (`2026-11-12T10:00:00+05`), and a time with no
+  offset (`2026-11-12T10:00:00`).
+
+JavaScript's `new Date().toISOString()` produces a valid value, and so does Python's
+`datetime.now(timezone.utc).isoformat()`. A job with an invalid timestamp fails validation, and the
+consumer rejects it without requeue (see [Broker Topology](#broker-topology)). A publisher refuses
+to send an event with an invalid timestamp.
+
 ## Routing And Namespace Rules
 
 Recommended exchange names:
