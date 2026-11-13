@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
+import { ZodError } from 'zod';
+
 import {
   buildRoutingKey,
   createMockEdgeChannel,
@@ -259,6 +261,67 @@ test('validateEnvelope accepts all public message types', () => {
   assert.equal(validateEnvelope(progressMessage).messageType, 'execution.progress');
   assert.equal(validateEnvelope(resultMessage).messageType, 'execution.result');
   assert.equal(validateEnvelope(failureMessage).messageType, 'execution.failure');
+});
+
+// Every timestamp field on the wire, each with a builder that sets it on an otherwise valid message.
+const timestampFields: Array<[field: string, build: (value: string) => unknown]> = [
+  ['timestamp', (value) => ({ ...createExecutionJob(), timestamp: value })],
+  ['payload.attempt.firstAttemptAt', (value) => {
+    const job = createExecutionJob();
+    return { ...job, payload: { ...job.payload, attempt: { firstAttemptAt: value } } };
+  }],
+  ['payload.attempt.previousAttemptAt', (value) => {
+    const job = createExecutionJob();
+    return { ...job, payload: { ...job.payload, attempt: { previousAttemptAt: value } } };
+  }],
+  ['payload.completedAt', (value) => {
+    const result = createResultMessage();
+    return { ...result, payload: { ...result.payload, completedAt: value } };
+  }],
+  ['payload.failedAt', (value) => {
+    const failure = createFailureMessage();
+    return { ...failure, payload: { ...failure.payload, failedAt: value } };
+  }],
+];
+
+const timestampCases: Array<[value: string, accepted: boolean]> = [
+  ['2026-11-12T10:00:00Z', true],
+  ['2026-11-12T10:00:00+05:30', true],
+  ['2026-11-12T10:00:00.123456Z', true],
+  ['2026-11-12T10:00Z', false], // minute precision
+  ['2026-11-12T10:00:00+0530', false], // offset without the colon
+  ['2026-11-12T10:00:00+05', false], // hours-only offset
+  ['2026-11-12T10:00:00', false], // no offset
+  ['2026-11-12t10:00:00z', false], // lower-case t and z
+  ['2026-11-12T10:00:60Z', false], // leap second
+];
+
+test('validateEnvelope accepts RFC 3339 timestamps with seconds and a Z or ±hh:mm offset, and nothing looser', () => {
+  for (const [field, build] of timestampFields) {
+    for (const [value, accepted] of timestampCases) {
+      const message = build(value);
+
+      if (accepted) {
+        assert.doesNotThrow(() => validateEnvelope(message), `${field} ${value} should be accepted`);
+      } else {
+        assert.throws(() => validateEnvelope(message), /^Error: invalid execution\.[a-z]+ envelope: /, `${field} ${value} should be rejected`);
+      }
+    }
+  }
+});
+
+test('an invalid timestamp surfaces as the library validation error, not a raw ZodError', () => {
+  assert.throws(
+    () => validateEnvelope({ ...createExecutionJob(), timestamp: '2026-11-12T10:00Z' }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.ok(!(error instanceof ZodError), 'a ZodError escaped validateEnvelope');
+      assert.equal(error.name, 'Error');
+      assert.match(error.message, /^invalid execution\.job envelope: /);
+      assert.match(error.message, /timestamp/);
+      return true;
+    },
+  );
 });
 
 test('buildRoutingKey keeps job and event namespaces separate', () => {

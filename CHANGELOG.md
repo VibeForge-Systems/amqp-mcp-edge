@@ -35,6 +35,30 @@ follows [Semantic Versioning](https://semver.org/). Version 0.1.0 has not been p
 
 ### Changed
 
+- `zod` is now `^4.6.7` (was `^3.25.64`), still a regular dependency. The range admits no 4.x
+  release before 4.5, the first to reject minute-precision timestamps
+- **Contract:** the timestamp fields (`timestamp`, `payload.attempt.firstAttemptAt`,
+  `payload.attempt.previousAttemptAt`, `payload.completedAt` and `payload.failedAt`) must be an
+  RFC 3339 date-time with seconds and a `Z` or `±hh:mm` offset. Minute precision
+  (`2026-11-12T10:00Z`) and an offset without the colon (`+0530`), which zod 3 accepted, are now
+  rejected: the consumer rejects a job carrying one without requeue, and the publisher refuses
+  an event carrying one.
+  `new Date().toISOString()` output is unaffected. `docs/PROTOCOL.md` documents the format, and
+  unit tests pin it
+- **Contract:** the integer fields (`payload.timeoutMs`, `payload.attempt.attemptNumber` and
+  `payload.attempt.maxAttempts`) must be safe integers, and progress `metrics` values must be
+  finite numbers. zod 3 accepted integers above `Number.MAX_SAFE_INTEGER` and `Infinity`. JSON
+  cannot carry `Infinity`, so that half affects only events built in process
+- validation errors from `validateEnvelope` and `assertCompatibleEnvelope` keep their
+  `invalid <messageType> envelope:` prefix, but the issue text after it is now zod 4's (for
+  example `invalid_format` and `Invalid ISO datetime` where zod 3 gave `invalid_string` and
+  `Invalid datetime`). Match on the prefix, not on the issue text
+- `amqplib` is now `^2.3.1` (was `^0.10.8`). It fixes GHSA-37f9-7m79-6866, in which a broker
+  could exhaust the client's memory, and so also caps incoming frames at 64 MiB by default
+  (`maxFrameSize`, settable as an `amqpUrl` query parameter). amqplib now bundles its type
+  definitions, so `@types/amqplib` is no longer a dev dependency
+- `?heartbeat=0` in `amqpUrl` now disables heartbeats. With amqplib 0.10 it meant no preference,
+  and the broker's suggested interval applied; omit the parameter to keep that behavior
 - **Contract:** consumers of `mcp.edge.events` must reject events without `user_id`. Events from
   earlier builds of this library carry none, so upgrade edge nodes before enforcing the rule
 - `createEdgeChannel` validates the config before it connects, so an invalid config no longer
