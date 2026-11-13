@@ -49,6 +49,12 @@ follows [Semantic Versioning](https://semver.org/). Version 0.1.0 has not been p
   `invalid <messageType> envelope:` prefix, but the issue text after it is now zod 4's (for
   example `invalid_format` and `Invalid ISO datetime` where zod 3 gave `invalid_string` and
   `Invalid datetime`). Match on the prefix, not on the issue text
+- `amqplib` is now `^2.3.1` (was `^0.10.8`). It fixes GHSA-37f9-7m79-6866, in which a broker
+  could exhaust the client's memory, and so also caps incoming frames at 64 MiB by default
+  (`maxFrameSize`, settable as an `amqpUrl` query parameter). amqplib now bundles its type
+  definitions, so `@types/amqplib` is no longer a dev dependency
+- `?heartbeat=0` in `amqpUrl` now disables heartbeats. With amqplib 0.10 it meant no preference,
+  and the broker's suggested interval applied; omit the parameter to keep that behavior
 - **Contract:** consumers of `mcp.edge.events` must reject events without `user_id`. Events from
   earlier builds of this library carry none, so upgrade edge nodes before enforcing the rule
 - `createEdgeChannel` validates the config before it connects, so an invalid config no longer
