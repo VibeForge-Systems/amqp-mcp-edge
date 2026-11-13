@@ -5,6 +5,13 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # engines.node is >=22, so the Node types stay on 22; their minor and patch updates still come.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+      # A TypeScript major changes the compiler itself; take one by hand, with typecheck and tests.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
