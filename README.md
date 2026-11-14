@@ -163,6 +163,8 @@ await channel.consumer.start();
 | `consumerQueueOptions` | `{ durable: true }` | Queue declaration options, in declare mode; ignored in passive mode |
 | `consumerTag` | assigned by the broker | Consumer tag for the subscription |
 | `prefetchCount` | `1` | Unacknowledged jobs the broker delivers at a time |
+| `maxDeliveryAttempts` | `2` | Deliveries of a job whose handler throws, the first included. After the last, the consumer publishes `execution.failure` (`DELIVERY_ATTEMPTS_EXHAUSTED`, `retryable: false`) and dead-letters the job |
+| `producer` | this library's name and version | The `producer` of events the library publishes itself, such as that failure |
 | `maxMessageSizeBytes` | `1048576` | Larger jobs are rejected without requeue |
 | `runtimeConsumerVersion` | — | Checked against a job's `compatibility.minConsumerVersion` |
 | `runtimeProducerVersion` | — | Checked against an event's `compatibility.minProducerVersion` |
@@ -349,9 +351,6 @@ runtime still has gaps that matter for production use. They will be closed befor
 
 - **No publisher confirms.** Events are published on a plain channel, so a broker-side loss after
   `publish` returns is not detected.
-- **A throwing job handler requeues indefinitely.** There is no retry limit or poison-message
-  handling yet; handle errors inside your handler and `nack` with `requeue: false` for permanent
-  failures.
 - **RabbitMQ 4.x refuses transient non-exclusive queues.** The default consumer queue is durable
   and unaffected. If you pass `consumerQueueOptions` with `durable: false`, also set
   `exclusive: true`; otherwise the broker closes the connection on declare.
@@ -434,6 +433,9 @@ The integration suite covers:
 
 - Full job lifecycle (dispatch → ack → progress → result)
 - Failure + requeue behavior via `nack(..., { requeue: true })`
+- A handler that always throws, on a classic and on a quorum queue: the job is delivered
+  `maxDeliveryAttempts` times, reported as `DELIVERY_ATTEMPTS_EXHAUSTED`, and dead-lettered, and
+  the job queued behind it runs
 - Passive topology: a missing queue or events exchange fails startup with an `EdgeTopologyError`,
   creates nothing, and leaves no reconnect loop running
 - Least privilege: a passive-mode worker whose user has configure `^$`, read on its own queue and

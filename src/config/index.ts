@@ -71,6 +71,22 @@ export interface EdgeChannelConfig {
   consumerQueueOptions?: Options.AssertQueue;
   consumerTag?: string;
   prefetchCount?: number;
+  /**
+   * How many times a job may be delivered to a handler that throws, counting the first delivery.
+   * When the handler throws on the last attempt, the consumer publishes `execution.failure` with
+   * code `DELIVERY_ATTEMPTS_EXHAUSTED` and `retryable: false`, then rejects the job without
+   * requeue, which dead-letters it. Defaults to 2: a throwing job is requeued once.
+   */
+  maxDeliveryAttempts?: number;
+  /**
+   * The `producer` of events the library publishes on its own, such as the failure above.
+   * Defaults to this library's name and version.
+   */
+  producer?: {
+    service: string;
+    version: string;
+    instanceId?: string;
+  };
   runtimeConsumerVersion?: string;
   runtimeProducerVersion?: string;
   connectionName?: string;
@@ -89,12 +105,16 @@ export interface ResolvedEdgeChannelConfig extends EdgeChannelConfig {
   eventsExchange: string;
   deadLetterExchange: string;
   prefetchCount: number;
+  maxDeliveryAttempts: number;
   maxMessageSizeBytes: number;
   reconnectEnabled: boolean;
   reconnectDelayMs: number;
   reconnectMaxDelayMs: number;
   backpressureTimeoutMs: number;
 }
+
+/** The default `maxDeliveryAttempts`: a job whose handler throws is requeued once, then dead-lettered. */
+export const defaultMaxDeliveryAttempts = 2;
 
 export const defaultExchangeConfig: ExchangeConfig = {
   jobsExchange: 'mcp.edge.jobs',
@@ -282,6 +302,7 @@ export function resolveConfig(config: EdgeChannelConfig): ResolvedEdgeChannelCon
     eventsExchange: config.eventsExchange ?? defaultExchangeConfig.eventsExchange,
     deadLetterExchange: config.deadLetterExchange ?? defaultExchangeConfig.deadLetterExchange,
     prefetchCount: config.prefetchCount ?? 1,
+    maxDeliveryAttempts: config.maxDeliveryAttempts ?? defaultMaxDeliveryAttempts,
     maxMessageSizeBytes: config.maxMessageSizeBytes ?? 1024 * 1024,
     reconnectEnabled: config.reconnectEnabled ?? true,
     reconnectDelayMs: config.reconnectDelayMs ?? 1000,
@@ -379,6 +400,25 @@ export function validateConfig(config: EdgeChannelConfig): string[] {
 
   if (config.prefetchCount !== undefined && (!Number.isInteger(config.prefetchCount) || config.prefetchCount <= 0)) {
     errors.push('prefetchCount must be a positive integer');
+  }
+
+  if (
+    config.maxDeliveryAttempts !== undefined &&
+    (!Number.isSafeInteger(config.maxDeliveryAttempts) || config.maxDeliveryAttempts <= 0)
+  ) {
+    errors.push('maxDeliveryAttempts must be a positive integer');
+  }
+
+  if (config.producer !== undefined) {
+    const { service, version, instanceId } = config.producer;
+
+    if (typeof service !== 'string' || service.length === 0 || typeof version !== 'string' || version.length === 0) {
+      errors.push('producer.service and producer.version must be non-empty strings');
+    }
+
+    if (instanceId !== undefined && (typeof instanceId !== 'string' || instanceId.length === 0)) {
+      errors.push('producer.instanceId must be a non-empty string when set');
+    }
   }
 
   if (

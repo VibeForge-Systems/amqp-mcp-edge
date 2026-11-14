@@ -37,8 +37,9 @@ export interface EdgeChannel {
 export async function createEdgeChannel(config: EdgeChannelConfig): Promise<EdgeChannel> {
   const connectionManager = new EdgeChannelConnectionManager(config);
   // Constructing these validates the config, before a connection is opened.
-  const consumer = new EdgeJobConsumer(config, connectionManager);
   const publisher = new EdgeEventPublisher(config, connectionManager);
+  // The consumer reports a job it dead-letters after its last delivery attempt through the publisher.
+  const consumer = new EdgeJobConsumer(config, connectionManager, { failurePublisher: publisher });
 
   await connectionManager.connect();
 

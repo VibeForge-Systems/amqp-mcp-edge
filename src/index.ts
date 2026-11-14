@@ -18,6 +18,7 @@ export {
   checkEventIdentity,
   defaultAmqpUsername,
   defaultExchangeConfig,
+  defaultMaxDeliveryAttempts,
   defaultQueueNamingStrategy,
   defaultRoutingKeyStrategy,
   eventRoutingTypes,
@@ -95,7 +96,7 @@ export {
   validateEnvelope,
 } from './contracts/index.js';
 
-export type { EdgeJobHandler, JobDeliveryContext } from './consumer/index.js';
+export type { EdgeJobConsumerOptions, EdgeJobHandler, JobDeliveryContext } from './consumer/index.js';
 export { EdgeJobConsumer } from './consumer/index.js';
 export { EdgeEventPublisher } from './publisher/index.js';
 

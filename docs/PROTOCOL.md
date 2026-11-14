@@ -399,6 +399,7 @@ may use other codes as well.
 | `TIMEOUT` | The job ran past `timeoutMs` and was stopped | see [Tool jobs](#tool-jobs) |
 | `INPUT_REQUIRED` | The tool answered `input_required` | `false` |
 | `HANDLER_ERROR` | Anything else that stopped the handler | the node's judgment |
+| `DELIVERY_ATTEMPTS_EXHAUSTED` | Published by the library: the handler threw on the last of `maxDeliveryAttempts` deliveries, and the job was dead-lettered; see [Delivery Attempts](#delivery-attempts) | `false` |
 | `PACKAGE_DOWNLOAD_FAILED` | The archive could not be downloaded | `true` |
 | `PACKAGE_URL_EXPIRED` | The signed URL had expired, or the store refused it | `true`, with a new URL |
 | `PACKAGE_HASH_UNSUPPORTED` | The node does not implement the dist hash's algorithm tag | `false` |
@@ -416,6 +417,40 @@ that receives a reserved task name it does not implement fails the job with
 changing its configuration) will be defined as `node.*` tasks, so they reuse the job's
 acknowledgement, timeout, idempotency and dead-lettering instead of needing a message type and
 routing of their own.
+
+## Delivery Attempts
+
+A job whose handler throws is redelivered a bounded number of times, then reported and
+dead-lettered, so one bad job cannot hold a node's queue.
+
+- **`deliveryAttempt`.** Each delivery reaches the handler with `deliveryAttempt`, counted from 1:
+  the first delivery, plus every requeue this consumer made of the same job attempt (the same
+  `messageId` and `attemptId`), plus the returns the broker counted in `x-delivery-count`. A job
+  the broker marks redelivered is at least attempt 2, even when this process never saw it before.
+- **`maxDeliveryAttempts`** (default 2). When the handler throws and `deliveryAttempt` is below
+  it, the consumer rejects the job with `requeue: true`. When the handler throws on attempt
+  `maxDeliveryAttempts`, the consumer publishes an `execution.failure` and then rejects the job
+  without requeue, which dead-letters it. The failure has code `DELIVERY_ATTEMPTS_EXHAUSTED`,
+  `retryable: false`, the job's `jobId` and `attemptId`, the node's `siteId` and `nodeId`, and
+  `details: { deliveryAttempt, maxDeliveryAttempts, handlerError }`, with the handler's error
+  message cut to 1000 characters.
+- **The job is dead-lettered even if that failure cannot be published**, for example when the
+  config has no `nodeId` or the broker refuses the event: requeueing it would restart the loop.
+  The consumer's `health()` then reports `failureReportErrors` and `lastFailureReportError`.
+- **A handler that settles the job itself keeps its outcome.** If it acks or nacks before it
+  throws, the consumer does nothing more. A handler's own `nack(delivery, { requeue: true })`
+  counts toward the next `deliveryAttempt` but is not limited by `maxDeliveryAttempts`; such a
+  handler should check `deliveryAttempt` itself.
+- **A new attempt starts over.** The control plane retries a job as a new message with a new
+  `attemptId`, whose first delivery is attempt 1 again.
+
+The count is kept by the consumer, in memory, because the broker does not keep it: RabbitMQ 4.4
+sets no `x-delivery-count` when a job is rejected with `requeue: true`, on classic or quorum
+queues, and classic queues never set it. A quorum queue does count a delivery whose channel closed
+while it was unacked, which is what happens when the node process crashes mid-job; the consumer
+adds that count, and the queue's `x-delivery-limit` dead-letters a job that keeps crashing the
+node (reason `delivery_limit`), a case the consumer cannot catch. Declare node queues as quorum
+queues with a small `x-delivery-limit`, such as 5, for that protection.
 
 ## Timestamp Format
 
@@ -495,7 +530,7 @@ Per node:
 
 | Entity | Declaration |
 |:---|:---|
-| queue `mcp.edge.consumer.<siteId>.<nodeId>` | durable (classic or quorum), argument `x-dead-letter-exchange: mcp.edge.dlx` |
+| queue `mcp.edge.consumer.<siteId>.<nodeId>` | durable (quorum recommended, with `x-delivery-limit`; see [Delivery Attempts](#delivery-attempts)), argument `x-dead-letter-exchange: mcp.edge.dlx` |
 | its bindings on `mcp.edge.jobs` | `edge.job.<siteId>.<nodeId>.*.*`, `edge.job.<siteId>.any.*.*`, `edge.job.any.<nodeId>.*.*`, `edge.job.any.any.*.*` |
 | a broker user for the node | with the permissions below |
 
@@ -542,7 +577,11 @@ needs no permission on the exchange or the queue for this. A job is dead-lettere
 - is larger than the node's `maxMessageSizeBytes`;
 - is not JSON, fails envelope validation, or is not an `execution.job`;
 - fails the compatibility check (`compatibility.minConsumerVersion`);
-- is rejected by the node's handler with `nack(delivery, { requeue: false })`.
+- made the node's handler throw on its last delivery attempt; the node first publishes an
+  `execution.failure` with code `DELIVERY_ATTEMPTS_EXHAUSTED` (see
+  [Delivery Attempts](#delivery-attempts));
+- is rejected by the node's handler with `nack(delivery, { requeue: false })`;
+- reached a quorum queue's `x-delivery-limit`; the `x-death` reason is then `delivery_limit`.
 
 The broker keeps the job's routing key and adds an `x-death` header naming the node queue, the
 reason (`rejected`) and the count. Jobs addressed to `any` keep `any` in their routing key, so bind
@@ -551,8 +590,8 @@ letters must be told apart by node. Without a queue bound to `mcp.edge.dlx`, the
 dead-lettered jobs silently, which is why the platform declares it before any node starts.
 
 Bound the queue's growth with a policy (for example `max-length` or `message-ttl`), and alert on
-its depth: a job in it was never run to completion, and for the first three cases above the node
-published no event about it.
+its depth: a job in it was never run to completion, and for the first three cases and the last
+case above the node published no event about it.
 
 ## Least-Privilege Permissions
 

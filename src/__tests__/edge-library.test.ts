@@ -9,6 +9,7 @@ import { ZodError } from 'zod';
 import {
   buildNodeKey,
   buildRoutingKey,
+  defaultMaxDeliveryAttempts,
   canonicalJson,
   checkEventIdentity,
   computeCapabilitiesDigest,
@@ -38,6 +39,8 @@ import {
   validateCompatibility,
   validateConfig,
   validateEnvelope,
+  type JobDeliveryContext,
+  type JobFailureEvent,
   type NodeCapabilitySnapshot,
 } from '../index.js';
 import {
@@ -115,6 +118,12 @@ class FakeTopologyChannel {
 
 const declaringCalls = /^(assertExchange|assertQueue|bindQueue|bindExchange|deleteExchange|deleteQueue)\b/;
 
+type FakeDelivery = {
+  fields: { deliveryTag: number; routingKey: string; redelivered: boolean };
+  properties?: { headers?: Record<string, unknown> };
+  content: Buffer;
+};
+
 class FakeConsumerChannel {
   public readonly calls: string[] = [];
 
@@ -128,15 +137,24 @@ class FakeConsumerChannel {
 
   public lastNackDeliveryTag?: number;
 
-  private consumeHandler?: (message: { fields: { deliveryTag: number; routingKey: string; redelivered: boolean }; content: Buffer } | null) => void;
+  // Acks and nacks in order, shared with a fake publisher when a test wants the interleaving.
+  public readonly settlements: string[] = [];
 
-  public ack(): void {
-    // no-op for test double
+  private consumeHandler?: (message: FakeDelivery | null) => void;
+
+  public constructor(public readonly log: string[] = []) {}
+
+  public ack(message: { fields: { deliveryTag: number } }): void {
+    this.settlements.push(`ack ${message.fields.deliveryTag}`);
+    this.log.push(`ack ${message.fields.deliveryTag}`);
   }
 
-  public nack(message: { fields: { deliveryTag: number } }): void {
+  public nack(message: { fields: { deliveryTag: number } }, _allUpTo?: boolean, requeue?: boolean): void {
     this.nackCount += 1;
     this.lastNackDeliveryTag = message.fields.deliveryTag;
+    const entry = `nack ${message.fields.deliveryTag} requeue=${String(requeue)}`;
+    this.settlements.push(entry);
+    this.log.push(entry);
   }
 
   public async assertExchange(name: string): Promise<void> {
@@ -158,7 +176,7 @@ class FakeConsumerChannel {
 
   public async consume(
     queueName: string,
-    handler: (message: { fields: { deliveryTag: number; routingKey: string; redelivered: boolean }; content: Buffer } | null) => void,
+    handler: (message: FakeDelivery | null) => void,
     _options?: { consumerTag?: string },
   ): Promise<{ consumerTag: string }> {
     this.calls.push(`consume ${queueName}`);
@@ -173,9 +191,10 @@ class FakeConsumerChannel {
     this.cancelledTags.push(consumerTag);
   }
 
-  public emitMessage(message: { fields: { deliveryTag: number; routingKey: string; redelivered: boolean }; content: Buffer }): void {
+  public emitMessage(message: FakeDelivery): void {
     assert.ok(this.consumeHandler, 'expected consume handler to be registered');
-    this.consumeHandler(message);
+    // amqplib always sets properties; headers is empty unless the publisher or broker set one.
+    this.consumeHandler({ properties: { headers: {} }, ...message });
   }
 }
 
@@ -1431,4 +1450,267 @@ test('edgeFailureCodes are distinct upper-case codes', () => {
   for (const code of codes) {
     assert.match(code, /^[A-Z][A-Z_]*[A-Z]$/);
   }
+});
+
+// --- Bounded delivery attempts --------------------------------------------------------------------
+
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+function jobDelivery(deliveryTag: number, redelivered: boolean, job = createExecutionJob(), headers: Record<string, unknown> = {}): FakeDelivery {
+  return {
+    fields: { deliveryTag, routingKey: 'edge.job.site-a.node-1.tool.search-documents', redelivered },
+    properties: { headers },
+    content: Buffer.from(JSON.stringify(job), 'utf8'),
+  };
+}
+
+class RecordingFailurePublisher {
+  public readonly failures: JobFailureEvent[] = [];
+
+  public error?: Error;
+
+  // Set by throwingConsumer to the channel's log, so a test sees publishes and settlements in order.
+  public log: string[] = [];
+
+  public async publishFailure(message: JobFailureEvent): Promise<void> {
+    if (this.error) {
+      throw this.error;
+    }
+
+    // The event is checked as the real publisher would check it.
+    assert.equal(validateEnvelope(message).messageType, 'execution.failure');
+    this.failures.push(message);
+    this.log.push(`failure ${message.payload.jobId}`);
+  }
+}
+
+// A consumer whose handler throws on every delivery. Pass `null` for a consumer with no publisher.
+function throwingConsumer(config: Partial<Parameters<typeof resolveConfig>[0]> = {}, publisher: RecordingFailurePublisher | null = new RecordingFailurePublisher()) {
+  const log: string[] = [];
+  const channel = new FakeConsumerChannel(log);
+  if (publisher) {
+    publisher.log = log;
+  }
+  const consumer = new EdgeJobConsumer(
+    { amqpUrl: 'amqp://test.local', siteId: 'site-a', nodeId: 'node-1', runtimeConsumerVersion: '0.1.0', ...config },
+    new FakeConsumerConnectionManager(channel) as never,
+    publisher ? { failurePublisher: publisher } : {},
+  );
+  const contexts: JobDeliveryContext[] = [];
+  consumer.onJob(async (_job, delivery) => {
+    contexts.push(delivery);
+    throw new Error('handler bug');
+  });
+  return { channel, consumer, contexts, log, publisher };
+}
+
+test('a handler that always throws is requeued once by default, then reported and dead-lettered', async () => {
+  assert.equal(defaultMaxDeliveryAttempts, 2);
+  assert.equal(resolveConfig({ amqpUrl: 'amqp://test.local' }).maxDeliveryAttempts, 2);
+  const { channel, consumer, contexts, log, publisher } = throwingConsumer();
+  await consumer.start();
+
+  channel.emitMessage(jobDelivery(1, false));
+  await settle();
+  assert.deepEqual(channel.settlements, ['nack 1 requeue=true']);
+  assert.equal(publisher?.failures.length, 0);
+
+  channel.emitMessage(jobDelivery(2, true));
+  await settle();
+  // The failure is published before the job is rejected without requeue.
+  assert.deepEqual(log, ['nack 1 requeue=true', 'failure job-1', 'nack 2 requeue=false']);
+  assert.deepEqual(contexts.map((context) => context.deliveryAttempt), [1, 2]);
+
+  const [failure] = publisher!.failures;
+  assert.equal(failure?.payload.code, 'DELIVERY_ATTEMPTS_EXHAUSTED');
+  assert.equal(failure?.payload.code, edgeFailureCodes.deliveryAttemptsExhausted);
+  assert.equal(failure?.payload.retryable, false);
+  assert.equal(failure?.payload.jobId, 'job-1');
+  assert.equal(failure?.payload.attemptId, 'attempt-1');
+  assert.equal(failure?.payload.siteId, 'site-a');
+  assert.equal(failure?.payload.nodeId, 'node-1');
+  assert.deepEqual(failure?.payload.details, { deliveryAttempt: 2, maxDeliveryAttempts: 2, handlerError: 'handler bug' });
+  assert.deepEqual(failure?.producer, { service: edgeLibraryName, version: edgeLibraryVersion });
+  assert.equal((await consumer.health()).details?.pendingDeliveries, 0);
+  await consumer.stop();
+});
+
+test('maxDeliveryAttempts counts this consumer\'s own requeues of the same job attempt', async () => {
+  const { channel, consumer, contexts, publisher } = throwingConsumer({ maxDeliveryAttempts: 3 });
+  await consumer.start();
+
+  // Each redelivery of one message: the broker's flag alone would say "at least 2" every time.
+  channel.emitMessage(jobDelivery(1, false));
+  await settle();
+  channel.emitMessage(jobDelivery(2, true));
+  await settle();
+  channel.emitMessage(jobDelivery(3, true));
+  await settle();
+
+  assert.deepEqual(contexts.map((context) => context.deliveryAttempt), [1, 2, 3]);
+  assert.deepEqual(channel.settlements, ['nack 1 requeue=true', 'nack 2 requeue=true', 'nack 3 requeue=false']);
+  assert.equal(publisher?.failures.length, 1);
+  assert.equal(publisher?.failures[0]?.payload.details?.deliveryAttempt, 3);
+
+  // A new attempt of the job (a new message) starts again from 1.
+  const retry = createExecutionJob({ messageId: 'job-message-2', payload: { ...createExecutionJob().payload, attemptId: 'attempt-2' } });
+  channel.emitMessage(jobDelivery(4, false, retry));
+  await settle();
+  assert.equal(contexts.at(-1)?.deliveryAttempt, 1);
+  assert.equal(channel.settlements.at(-1), 'nack 4 requeue=true');
+  await consumer.stop();
+});
+
+test('a redelivered job with no local count is attempt 2, and x-delivery-count adds broker returns', async () => {
+  const { channel, consumer, contexts, publisher } = throwingConsumer({ maxDeliveryAttempts: 4 });
+  await consumer.start();
+
+  // Redelivered after a restart or a dropped connection: this process never saw it.
+  channel.emitMessage(jobDelivery(1, true));
+  await settle();
+  // A quorum queue counted two returns of a channel that closed with it unacked.
+  const other = createExecutionJob({ messageId: 'job-message-3', payload: { ...createExecutionJob().payload, jobId: 'job-3', attemptId: 'attempt-3' } });
+  channel.emitMessage(jobDelivery(2, true, other, { 'x-delivery-count': 2 }));
+  await settle();
+  // A header that is not a count is ignored.
+  const third = createExecutionJob({ messageId: 'job-message-4', payload: { ...createExecutionJob().payload, jobId: 'job-4', attemptId: 'attempt-4' } });
+  channel.emitMessage(jobDelivery(3, false, third, { 'x-delivery-count': 'many' }));
+  await settle();
+
+  assert.deepEqual(contexts.map((context) => context.deliveryAttempt), [2, 3, 1]);
+  assert.deepEqual(channel.settlements, ['nack 1 requeue=true', 'nack 2 requeue=true', 'nack 3 requeue=true']);
+
+  channel.emitMessage(jobDelivery(4, true, other, { 'x-delivery-count': 2 }));
+  await settle();
+  // 1 + 2 broker returns + 1 requeue by this consumer = 4, the last attempt.
+  assert.equal(contexts.at(-1)?.deliveryAttempt, 4);
+  assert.equal(channel.settlements.at(-1), 'nack 4 requeue=false');
+  assert.equal(publisher?.failures[0]?.payload.jobId, 'job-3');
+  await consumer.stop();
+});
+
+test('maxDeliveryAttempts 1 dead-letters on the first throw', async () => {
+  const { channel, consumer, publisher } = throwingConsumer({ maxDeliveryAttempts: 1 });
+  await consumer.start();
+  channel.emitMessage(jobDelivery(1, false));
+  await settle();
+  assert.deepEqual(channel.settlements, ['nack 1 requeue=false']);
+  assert.equal(publisher?.failures.length, 1);
+  await consumer.stop();
+});
+
+test('the last attempt is dead-lettered even when the failure cannot be reported, and health says why', async () => {
+  const failing = new RecordingFailurePublisher();
+  failing.error = new Error('broker refused the publish');
+  const cases: Array<[label: string, setup: ReturnType<typeof throwingConsumer>, reason: RegExp]> = [
+    ['publish fails', throwingConsumer({ maxDeliveryAttempts: 1 }, failing), /execution\.failure for job job-1 was not published: broker refused the publish/],
+    ['no publisher', throwingConsumer({ maxDeliveryAttempts: 1 }, null), /no failure publisher/],
+    ['no nodeId', throwingConsumer({ maxDeliveryAttempts: 1, nodeId: undefined, nodeGroup: 'group-a' }), /no nodeId/],
+  ];
+
+  for (const [label, { channel, consumer }, reason] of cases) {
+    await consumer.start();
+    channel.emitMessage(jobDelivery(1, false));
+    await settle();
+    assert.deepEqual(channel.settlements, ['nack 1 requeue=false'], label);
+    const health = await consumer.health();
+    assert.equal(health.details?.failureReportErrors, 1, label);
+    assert.match(String(health.details?.lastFailureReportError), reason, label);
+    await consumer.stop();
+  }
+});
+
+test('a handler that settles its delivery and then throws keeps its own outcome', async () => {
+  const channel = new FakeConsumerChannel();
+  const publisher = new RecordingFailurePublisher();
+  const consumer = new EdgeJobConsumer(
+    { amqpUrl: 'amqp://test.local', siteId: 'site-a', nodeId: 'node-1', runtimeConsumerVersion: '0.1.0', maxDeliveryAttempts: 1 },
+    new FakeConsumerConnectionManager(channel) as never,
+    { failurePublisher: publisher },
+  );
+  consumer.onJob(async (_job, delivery) => {
+    await consumer.ack(delivery);
+    throw new Error('after ack');
+  });
+  await consumer.start();
+  channel.emitMessage(jobDelivery(1, false));
+  await settle();
+  assert.deepEqual(channel.settlements, ['ack 1']);
+  assert.equal(publisher.failures.length, 0);
+  await consumer.stop();
+});
+
+test('a handler\'s own requeue counts toward deliveryAttempt, but is not limited by the consumer', async () => {
+  const channel = new FakeConsumerChannel();
+  const consumer = new EdgeJobConsumer(
+    { amqpUrl: 'amqp://test.local', siteId: 'site-a', nodeId: 'node-1', runtimeConsumerVersion: '0.1.0' },
+    new FakeConsumerConnectionManager(channel) as never,
+  );
+  const attempts: Array<number | undefined> = [];
+  consumer.onJob(async (_job, delivery) => {
+    attempts.push(delivery.deliveryAttempt);
+    await consumer.nack(delivery, { requeue: true });
+  });
+  await consumer.start();
+  for (const [tag, redelivered] of [[1, false], [2, true], [3, true]] as const) {
+    channel.emitMessage(jobDelivery(tag, redelivered));
+    await settle();
+  }
+  assert.deepEqual(attempts, [1, 2, 3]);
+  assert.deepEqual(channel.settlements, ['nack 1 requeue=true', 'nack 2 requeue=true', 'nack 3 requeue=true']);
+  await consumer.stop();
+});
+
+test('validateConfig checks maxDeliveryAttempts and producer, and the failure uses a configured producer', async () => {
+  assert.deepEqual(validateConfig({ amqpUrl: 'amqp://test.local', maxDeliveryAttempts: 0 }), ['maxDeliveryAttempts must be a positive integer']);
+  assert.deepEqual(validateConfig({ amqpUrl: 'amqp://test.local', maxDeliveryAttempts: 1.5 }), ['maxDeliveryAttempts must be a positive integer']);
+  assert.deepEqual(validateConfig({ amqpUrl: 'amqp://test.local', producer: { service: '', version: '1' } }), ['producer.service and producer.version must be non-empty strings']);
+  assert.deepEqual(validateConfig({ amqpUrl: 'amqp://test.local', producer: { service: 'w', version: '1', instanceId: '' } }), ['producer.instanceId must be a non-empty string when set']);
+
+  const producer = { service: 'edge-worker', version: '3.1.0', instanceId: 'worker-7' };
+  const { channel, consumer, publisher } = throwingConsumer({ maxDeliveryAttempts: 1, producer });
+  await consumer.start();
+  channel.emitMessage(jobDelivery(1, false));
+  await settle();
+  assert.deepEqual(publisher?.failures[0]?.producer, producer);
+  await consumer.stop();
+});
+
+test('the failure event truncates a long handler error', async () => {
+  const channel = new FakeConsumerChannel();
+  const publisher = new RecordingFailurePublisher();
+  const consumer = new EdgeJobConsumer(
+    { amqpUrl: 'amqp://test.local', siteId: 'site-a', nodeId: 'node-1', runtimeConsumerVersion: '0.1.0', maxDeliveryAttempts: 1 },
+    new FakeConsumerConnectionManager(channel) as never,
+    { failurePublisher: publisher },
+  );
+  consumer.onJob(async () => {
+    throw new Error('x'.repeat(5000));
+  });
+  await consumer.start();
+  channel.emitMessage(jobDelivery(1, false));
+  await settle();
+  assert.equal(String(publisher.failures[0]?.payload.details?.handlerError).length, 1001);
+  await consumer.stop();
+});
+
+test('mock edge channel requeues a throwing handler until the last attempt, then reports and dead-letters it', async () => {
+  const channel = createMockEdgeChannel({ amqpUrl: 'amqp://node-1:secret@broker.example.com', siteId: 'site-a', nodeId: 'node-1' });
+  channel.consumer.onJob(async () => {
+    throw new Error('handler bug');
+  });
+  await channel.consumer.start();
+
+  const first = await channel.dispatchJob(createExecutionJob());
+  const second = await channel.dispatchJob(createExecutionJob(), { redelivered: true });
+
+  assert.equal(first.deliveryAttempt, 1);
+  assert.equal(second.deliveryAttempt, 2);
+  assert.deepEqual(channel.getDeliveries().map((delivery) => [delivery.status, delivery.requeue]), [['nacked', true], ['nacked', false]]);
+  const [event] = channel.getPublishedEvents();
+  assert.equal(event?.routingKey, 'edge.event.failure.site-a.node-1');
+  assert.ok(event?.message.messageType === 'execution.failure');
+  assert.equal(event.message.payload.code, 'DELIVERY_ATTEMPTS_EXHAUSTED');
+  assert.equal(event.message.payload.retryable, false);
+  await channel.close();
 });

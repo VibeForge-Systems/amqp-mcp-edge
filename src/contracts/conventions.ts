@@ -19,6 +19,11 @@ export const edgeFailureCodes = {
   inputRequired: 'INPUT_REQUIRED',
   /** The handler failed for a reason no other code covers. */
   handlerError: 'HANDLER_ERROR',
+  /**
+   * Published by the library: the handler threw on every one of `maxDeliveryAttempts` deliveries,
+   * and the job was dead-lettered.
+   */
+  deliveryAttemptsExhausted: 'DELIVERY_ATTEMPTS_EXHAUSTED',
   /** The package could not be downloaded. */
   packageDownloadFailed: 'PACKAGE_DOWNLOAD_FAILED',
   /** The signed download URL had expired, or the store refused it. */

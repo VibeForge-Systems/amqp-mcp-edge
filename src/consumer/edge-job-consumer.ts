@@ -1,17 +1,44 @@
+import { randomUUID } from 'node:crypto';
+
 import type { Channel, ConsumeMessage, Options } from 'amqplib';
 
-import type { EdgeChannelConfig } from '../config/index.js';
+import type { EdgeChannelConfig, ResolvedEdgeChannelConfig } from '../config/index.js';
 import { buildConsumerQueueName, buildJobBindingKeys, resolveConfig, validateConfig } from '../config/index.js';
-import { assertCompatibleEnvelope, type ExecutionJobEnvelope } from '../contracts/index.js';
+import { assertCompatibleEnvelope, edgeFailureCodes, type ExecutionJobEnvelope, type JobFailureEvent } from '../contracts/index.js';
 import type { EdgeChannelConnectionManager } from '../connection/connection-manager.js';
 import { createHealthSnapshot, type EdgeChannelHealth } from '../health/index.js';
 import { checkTopology, EdgeTopologyError } from '../topology/index.js';
+import { edgeLibraryName, edgeLibraryVersion } from '../version.js';
 
 export interface JobDeliveryContext {
   deliveryTag?: number;
   routingKey?: string;
   redelivered?: boolean;
+  /**
+   * Which delivery of this job this is, starting at 1: the first delivery, plus every requeue this
+   * consumer made, plus every return the broker counted in `x-delivery-count` (a quorum queue
+   * counts a delivery whose channel closed unacked). At least 2 when the broker marks it
+   * redelivered.
+   */
+  deliveryAttempt?: number;
 }
+
+/** What the consumer needs to report a job it gives up on. `createEdgeChannel` passes its publisher. */
+export interface EdgeJobConsumerOptions {
+  failurePublisher?: { publishFailure(message: JobFailureEvent): Promise<void> };
+}
+
+interface PendingDelivery {
+  message: ConsumeMessage;
+  attemptKey: string;
+}
+
+// Requeue counts are kept per job attempt for this many attempts at most; the oldest is forgotten
+// first. A forgotten count only means a later delivery is counted from the broker's flags again.
+const maxTrackedAttempts = 10_000;
+
+// Room for the handler's error in the failure event, which a control plane may show to people.
+const maxReportedErrorLength = 1000;
 
 export type EdgeJobHandler = (job: ExecutionJobEnvelope, context: JobDeliveryContext) => Promise<void>;
 
@@ -24,6 +51,42 @@ export interface EdgeJobConsumer {
   health(): Promise<EdgeChannelHealth>;
 }
 
+/**
+ * The `execution.failure` the consumer publishes when the handler threw on the last delivery
+ * attempt. Shared with the mock channel, so tests see the same event.
+ */
+export function createExhaustedFailureEvent(
+  config: Pick<ResolvedEdgeChannelConfig, 'maxDeliveryAttempts' | 'producer' | 'siteId'>,
+  nodeId: string,
+  job: ExecutionJobEnvelope,
+  deliveryAttempt: number,
+  reason: string,
+): JobFailureEvent {
+  const { maxDeliveryAttempts } = config;
+  const handlerError = reason.length > maxReportedErrorLength ? `${reason.slice(0, maxReportedErrorLength)}…` : reason;
+  const now = new Date().toISOString();
+
+  return {
+    specVersion: '1.0',
+    messageType: 'execution.failure',
+    messageId: randomUUID(),
+    timestamp: now,
+    producer: config.producer ?? { service: edgeLibraryName, version: edgeLibraryVersion },
+    compatibility: { channelVersion: edgeLibraryVersion },
+    payload: {
+      jobId: job.payload.jobId,
+      attemptId: job.payload.attemptId,
+      ...(config.siteId ? { siteId: config.siteId } : {}),
+      nodeId,
+      failedAt: now,
+      retryable: false,
+      code: edgeFailureCodes.deliveryAttemptsExhausted,
+      message: `the job handler threw on delivery ${deliveryAttempt} of at most ${maxDeliveryAttempts}; the job was dead-lettered`,
+      details: { deliveryAttempt, maxDeliveryAttempts, handlerError },
+    },
+  };
+}
+
 export class EdgeJobConsumer implements EdgeJobConsumer {
   private readonly config;
 
@@ -31,7 +94,15 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
 
   private jobHandler: EdgeJobHandler = async () => undefined;
 
-  private readonly pendingDeliveries = new Map<number, ConsumeMessage>();
+  private readonly pendingDeliveries = new Map<number, PendingDelivery>();
+
+  private readonly requeueCounts = new Map<string, number>();
+
+  private readonly failurePublisher?: EdgeJobConsumerOptions['failurePublisher'];
+
+  private failureReportErrors = 0;
+
+  private lastFailureReportError?: string;
 
   private consumerActive = false;
 
@@ -41,7 +112,11 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
 
   private topologyError?: EdgeTopologyError;
 
-  public constructor(config: EdgeChannelConfig, connectionManager: EdgeChannelConnectionManager) {
+  public constructor(
+    config: EdgeChannelConfig,
+    connectionManager: EdgeChannelConnectionManager,
+    options: EdgeJobConsumerOptions = {},
+  ) {
     const validationErrors = validateConfig(config);
 
     if (validationErrors.length > 0) {
@@ -50,6 +125,7 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
 
     this.config = resolveConfig(config);
     this.connectionManager = connectionManager;
+    this.failurePublisher = options.failurePublisher;
     connectionManager.onReconnect(async () => {
       // A new connection may reach a broker whose topology changed while this node was away, so a
       // passive-mode consumer checks its queue again, once, before it subscribes.
@@ -106,17 +182,31 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
   }
 
   public async ack(delivery: JobDeliveryContext): Promise<void> {
-    const message = this.getPendingMessage(delivery.deliveryTag);
+    const pending = this.getPendingDelivery(delivery.deliveryTag);
     const channel = await this.connectionManager.getConsumerChannel();
-    channel.ack(message);
-    this.pendingDeliveries.delete(message.fields.deliveryTag);
+    channel.ack(pending.message);
+    this.pendingDeliveries.delete(pending.message.fields.deliveryTag);
+    this.requeueCounts.delete(pending.attemptKey);
   }
 
+  /**
+   * Rejects a job. With `requeue: true` the broker delivers it again, and the next delivery's
+   * `deliveryAttempt` counts this requeue; the consumer does not limit requeues a handler asks for,
+   * so a handler that requeues should check `deliveryAttempt` itself. Without it (the default) the
+   * job is dead-lettered.
+   */
   public async nack(delivery: JobDeliveryContext, options: { requeue?: boolean; reason?: string } = {}): Promise<void> {
-    const message = this.getPendingMessage(delivery.deliveryTag);
+    const pending = this.getPendingDelivery(delivery.deliveryTag);
+    const requeue = options.requeue ?? false;
     const channel = await this.connectionManager.getConsumerChannel();
-    channel.nack(message, false, options.requeue ?? false);
-    this.pendingDeliveries.delete(message.fields.deliveryTag);
+    channel.nack(pending.message, false, requeue);
+    this.pendingDeliveries.delete(pending.message.fields.deliveryTag);
+
+    if (requeue) {
+      this.countRequeue(pending.attemptKey);
+    } else {
+      this.requeueCounts.delete(pending.attemptKey);
+    }
   }
 
   public async health(): Promise<EdgeChannelHealth> {
@@ -128,7 +218,11 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
       publisherActive: connectionHealth.publisherActive,
       details: {
         pendingDeliveries: this.pendingDeliveries.size,
+        maxDeliveryAttempts: this.config.maxDeliveryAttempts,
         ...(this.topologyError ? { topologyError: this.topologyError.message } : {}),
+        ...(this.failureReportErrors > 0
+          ? { failureReportErrors: this.failureReportErrors, lastFailureReportError: this.lastFailureReportError }
+          : {}),
       },
     });
   }
@@ -262,37 +356,104 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
       return;
     }
 
+    // One job attempt is one messageId and attemptId; the control plane sends a new attempt as a new
+    // message, which starts counting from 1 again.
+    const attemptKey = `${envelope.messageId}\u0000${envelope.payload.attemptId}`;
+    const deliveryAttempt = this.countDeliveryAttempt(message, attemptKey);
     const context: JobDeliveryContext = {
       deliveryTag: message.fields.deliveryTag,
       routingKey: message.fields.routingKey,
       redelivered: message.fields.redelivered,
+      deliveryAttempt,
     };
 
-    this.pendingDeliveries.set(message.fields.deliveryTag, message);
+    this.pendingDeliveries.set(message.fields.deliveryTag, { message, attemptKey });
 
     try {
       await this.jobHandler(envelope, context);
     } catch (error) {
-      if (this.pendingDeliveries.has(message.fields.deliveryTag)) {
-        await this.nack(context, {
-          requeue: true,
-          reason: error instanceof Error ? error.message : 'job handler failed',
-        });
+      if (!this.pendingDeliveries.has(message.fields.deliveryTag)) {
+        // The handler acked or nacked before it threw; that outcome stands.
+        return;
       }
+
+      const reason = error instanceof Error ? error.message : String(error);
+
+      if (deliveryAttempt < this.config.maxDeliveryAttempts) {
+        await this.nack(context, { requeue: true, reason });
+        return;
+      }
+
+      // The last attempt: tell the control plane before the job leaves for the dead-letter queue.
+      await this.reportExhausted(envelope, deliveryAttempt, reason);
+      await this.nack(context, { requeue: false, reason });
     }
   }
 
-  private getPendingMessage(deliveryTag?: number): ConsumeMessage {
+  private countDeliveryAttempt(message: ConsumeMessage, attemptKey: string): number {
+    const brokerCount = message.properties.headers?.['x-delivery-count'];
+    const brokerReturns = typeof brokerCount === 'number' && Number.isSafeInteger(brokerCount) && brokerCount > 0 ? brokerCount : 0;
+    const counted = 1 + brokerReturns + (this.requeueCounts.get(attemptKey) ?? 0);
+
+    // A redelivered job this process has no count for was delivered at least once before: to an
+    // earlier run of the node, or on a connection that dropped.
+    return message.fields.redelivered ? Math.max(2, counted) : counted;
+  }
+
+  private countRequeue(attemptKey: string): void {
+    const count = (this.requeueCounts.get(attemptKey) ?? 0) + 1;
+    // Delete first, so that set() moves the key to the newest end of the insertion order.
+    this.requeueCounts.delete(attemptKey);
+    this.requeueCounts.set(attemptKey, count);
+
+    while (this.requeueCounts.size > maxTrackedAttempts) {
+      const oldest = this.requeueCounts.keys().next().value;
+
+      if (oldest === undefined) {
+        break;
+      }
+
+      this.requeueCounts.delete(oldest);
+    }
+  }
+
+  private async reportExhausted(job: ExecutionJobEnvelope, deliveryAttempt: number, reason: string): Promise<void> {
+    const recordError = (message: string) => {
+      this.failureReportErrors += 1;
+      this.lastFailureReportError = message;
+    };
+
+    if (!this.failurePublisher) {
+      recordError(`job ${job.payload.jobId} was dead-lettered without an execution.failure: the consumer has no failure publisher`);
+      return;
+    }
+
+    if (!this.config.nodeId) {
+      recordError(`job ${job.payload.jobId} was dead-lettered without an execution.failure: the config has no nodeId to report it under`);
+      return;
+    }
+
+    try {
+      await this.failurePublisher.publishFailure(
+        createExhaustedFailureEvent(this.config, this.config.nodeId, job, deliveryAttempt, reason),
+      );
+    } catch (error) {
+      // The job is dead-lettered regardless: requeueing it would start the loop this exists to end.
+      recordError(`execution.failure for job ${job.payload.jobId} was not published: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private getPendingDelivery(deliveryTag?: number): PendingDelivery {
     if (deliveryTag === undefined) {
       throw new Error('deliveryTag is required');
     }
 
-    const message = this.pendingDeliveries.get(deliveryTag);
+    const pending = this.pendingDeliveries.get(deliveryTag);
 
-    if (!message) {
+    if (!pending) {
       throw new Error(`delivery ${deliveryTag} is not pending`);
     }
 
-    return message;
+    return pending;
   }
 }

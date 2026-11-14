@@ -8,6 +8,7 @@ import type { Channel, ChannelModel, ConsumeMessage } from 'amqplib';
 import {
   buildConsumerQueueName,
   buildJobBindingKeys,
+  edgeFailureCodes,
   buildJobRoutingKey,
   buildRoutingKey,
   checkEventIdentity,
@@ -826,7 +827,11 @@ interface LeastPrivilegeHarness {
 // exchanges under their production names, the node queue with its dead-letter exchange and
 // bindings, a dead-letter queue, and a broker user with the least-privilege permission set from
 // docs/PROTOCOL.md. Everything is removed after the test.
-async function createLeastPrivilegeHarness(t: TestContext, api: ManagementApi): Promise<LeastPrivilegeHarness> {
+async function createLeastPrivilegeHarness(
+  t: TestContext,
+  api: ManagementApi,
+  options: { queueType?: 'classic' | 'quorum' } = {},
+): Promise<LeastPrivilegeHarness> {
   const cleanup = new CleanupStack(t);
   const runId = crypto.randomUUID().slice(0, 8);
   const siteId = `site-${runId}`;
@@ -868,7 +873,10 @@ async function createLeastPrivilegeHarness(t: TestContext, api: ManagementApi): 
   // transient non-exclusive queues.
   await controlChannel.assertQueue(queueName, {
     durable: true,
-    arguments: { 'x-dead-letter-exchange': deadLetterExchange },
+    arguments: {
+      'x-dead-letter-exchange': deadLetterExchange,
+      ...(options.queueType ? { 'x-queue-type': options.queueType } : {}),
+    },
   });
   cleanup.defer(() => withChannel(controlConnection, (channel) => channel.deleteQueue(queueName)));
   for (const bindingKey of buildJobBindingKeys(nodeConfig)) {
@@ -1263,3 +1271,95 @@ test('least privilege: node.hello, node.heartbeat and a package.install job roun
   assert.notEqual(heartbeat.payload.capabilitiesDigest, hello.payload.capabilitiesDigest);
   assert.equal(heartbeat.payload.sessionId, hello.payload.sessionId);
 });
+
+for (const queueType of ['classic', 'quorum'] as const) {
+  test(`poison job on a ${queueType} queue: delivered maxDeliveryAttempts times, reported, dead-lettered, and the next job runs`, { timeout: 60000 }, async (t) => {
+    const api = await managementApiOrSkip(t);
+    if (!api) {
+      return;
+    }
+
+    const harness = await createLeastPrivilegeHarness(t, api, { queueType });
+    const { jobsExchange } = defaultExchangeConfig;
+    const edgeChannel = await createEdgeChannel({
+      amqpUrl: harness.nodeAmqpUrl,
+      siteId: harness.siteId,
+      nodeId: harness.nodeId,
+      topologyMode: 'passive',
+      runtimeConsumerVersion: '0.1.0',
+      runtimeProducerVersion: '0.1.0',
+      connectionName: `amqp-mcp-edge-poison-${queueType}-${harness.runId}`,
+    });
+    harness.cleanup.defer(() => edgeChannel.close());
+
+    const deliveries: Array<{ jobId: string; deliveryAttempt?: number; redelivered?: boolean }> = [];
+    edgeChannel.consumer.onJob(async (job, delivery) => {
+      deliveries.push({ jobId: job.payload.jobId, deliveryAttempt: delivery.deliveryAttempt, redelivered: delivery.redelivered });
+
+      if (job.payload.jobId.startsWith('poison-')) {
+        throw new Error('handler bug: cannot process this job');
+      }
+
+      await edgeChannel.publisher.publishResult(
+        createResultMessage({
+          messageId: `result-${job.payload.jobId}`,
+          payload: { jobId: job.payload.jobId, attemptId: job.payload.attemptId, siteId: harness.siteId, nodeId: harness.nodeId, completedAt: new Date().toISOString(), output: { ok: true } },
+        }),
+      );
+      await edgeChannel.consumer.ack(delivery);
+    });
+    await edgeChannel.consumer.start();
+
+    const events = collectDeliveries(harness.controlChannel, harness.controlQueueName, 2, 15000);
+    const deadLettered = collectDeliveries(harness.controlChannel, harness.deadLetterQueueName, 1, 15000);
+    const publishJob = (jobId: string) => {
+      const job = createExecutionJob({
+        messageId: `message-${jobId}`,
+        payload: { ...createExecutionJob().payload, jobId, attemptId: `${jobId}-attempt-1`, idempotencyKey: jobId, target: { siteId: harness.siteId, nodeId: harness.nodeId } },
+      });
+      harness.controlChannel.publish(jobsExchange, buildJobRoutingKey(job.payload.target, job.payload.capability), Buffer.from(JSON.stringify(job), 'utf8'), {
+        contentType: 'application/json',
+        messageId: job.messageId,
+        persistent: true,
+        userId: harness.adminUser,
+      });
+    };
+
+    // The poison job first, then a good one queued behind it.
+    publishJob(`poison-${harness.runId}`);
+    publishJob(`good-${harness.runId}`);
+
+    const received = (await events).map((message) => {
+      const envelope = validateEnvelope(JSON.parse(message.content.toString('utf8')));
+      assert.ok(envelope.messageType === 'execution.failure' || envelope.messageType === 'execution.result', envelope.messageType);
+      return envelope;
+    });
+    const failure = received.find((envelope) => envelope.messageType === 'execution.failure');
+    const result = received.find((envelope) => envelope.messageType === 'execution.result');
+
+    assert.ok(failure?.messageType === 'execution.failure');
+    assert.equal(failure.payload.jobId, `poison-${harness.runId}`);
+    assert.equal(failure.payload.code, edgeFailureCodes.deliveryAttemptsExhausted);
+    assert.equal(failure.payload.retryable, false);
+    assert.equal(failure.payload.nodeId, harness.nodeId);
+    assert.equal(failure.payload.details?.handlerError, 'handler bug: cannot process this job');
+    assert.ok(result?.messageType === 'execution.result');
+    assert.equal(result.payload.jobId, `good-${harness.runId}`);
+
+    // The poison job reached the dead-letter queue the platform bound, rejected by the node queue.
+    const [deadLetter] = await deadLettered;
+    assert.equal(deadLetter?.properties.messageId, `message-poison-${harness.runId}`);
+    const death = (deadLetter?.properties.headers?.['x-death'] as Array<{ queue?: string; reason?: string }> | undefined)?.[0];
+    assert.equal(death?.queue, harness.queueName);
+    assert.equal(death?.reason, 'rejected');
+
+    // Exactly maxDeliveryAttempts (2) deliveries of the poison job, and one of the good job.
+    await sleep(500);
+    const poison = deliveries.filter((delivery) => delivery.jobId.startsWith('poison-'));
+    assert.deepEqual(poison.map((delivery) => [delivery.deliveryAttempt, delivery.redelivered]), [[1, false], [2, true]]);
+    assert.equal(deliveries.filter((delivery) => delivery.jobId.startsWith('good-')).length, 1);
+    const health = await edgeChannel.consumer.health();
+    assert.equal(health.details?.pendingDeliveries, 0);
+    assert.equal(health.details?.failureReportErrors, undefined);
+  });
+}

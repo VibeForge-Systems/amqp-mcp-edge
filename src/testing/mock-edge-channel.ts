@@ -1,5 +1,6 @@
-import type { EdgeChannelConfig } from '../config/index.js';
+import type { EdgeChannelConfig, ResolvedEdgeChannelConfig } from '../config/index.js';
 import { buildRoutingKey, resolveConfig, resolveUserId } from '../config/index.js';
+import { createExhaustedFailureEvent } from '../consumer/edge-job-consumer.js';
 import {
   validateEnvelope,
   type ExecutionJobEnvelope,
@@ -43,6 +44,11 @@ class MockEdgeJobConsumer {
   private active = false;
 
   private nextDeliveryTag = 1;
+
+  public constructor(
+    private readonly config: ResolvedEdgeChannelConfig,
+    private readonly publisher: MockEdgeEventPublisher,
+  ) {}
 
   public onJob(handler: EdgeJobHandler): void {
     this.jobHandler = handler;
@@ -101,6 +107,7 @@ class MockEdgeJobConsumer {
           capabilityName: validatedEnvelope.payload.capability.name,
         }),
       redelivered: deliveryOverrides.redelivered ?? false,
+      deliveryAttempt: deliveryOverrides.deliveryAttempt ?? (deliveryOverrides.redelivered ? 2 : 1),
     };
 
     this.nextDeliveryTag += 1;
@@ -108,11 +115,22 @@ class MockEdgeJobConsumer {
 
     try {
       await this.jobHandler(validatedEnvelope, context);
-    } catch {
+    } catch (error) {
+      // What the real consumer does with a handler that throws: requeue until the last attempt,
+      // then publish execution.failure and dead-letter.
       const record = this.getDelivery(context.deliveryTag);
       if (record.status === 'pending') {
+        const lastAttempt = (context.deliveryAttempt ?? 1) >= this.config.maxDeliveryAttempts;
+
+        if (lastAttempt && this.config.nodeId) {
+          const reason = error instanceof Error ? error.message : String(error);
+          await this.publisher.publishFailure(
+            createExhaustedFailureEvent(this.config, this.config.nodeId, validatedEnvelope, context.deliveryAttempt ?? 1, reason),
+          );
+        }
+
         record.status = 'nacked';
-        record.requeue = true;
+        record.requeue = !lastAttempt;
       }
     }
 
@@ -221,8 +239,8 @@ export function createMockEdgeChannel(config: Partial<EdgeChannelConfig> = {}): 
     ...config,
   });
 
-  const consumer = new MockEdgeJobConsumer();
   const publisher = new MockEdgeEventPublisher(resolvedConfig);
+  const consumer = new MockEdgeJobConsumer(resolvedConfig, publisher);
 
   return {
     consumer,
