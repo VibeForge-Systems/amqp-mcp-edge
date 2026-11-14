@@ -1,0 +1,251 @@
+name: Release
+
+# A version tag (vX.Y.Z, or vX.Y.Z-<prerelease>) runs three jobs:
+#   build    typecheck, unit and integration tests against RabbitMQ, build, and pack. Read-only.
+#   release  publishes a GitHub Release with the packed tarball and its SHA-256. The only job that
+#            can write to the repository.
+#   npm      publishes that same tarball to npm with provenance, after checking its SHA-256.
+#
+# npm publishing is off until the maintainer turns it on with the repository variable NPM_PUBLISH:
+#   token    publish with the NPM_TOKEN secret, an npm token that can publish to the scope
+#   trusted  publish through npm trusted publishing (OIDC), with no stored secret. The trusted
+#            publisher on npmjs.com names this repository, this workflow file (release.yml) and
+#            the environment `npm`
+# Unset, the npm job is skipped and the run summary says so. An npm release cannot be taken back,
+# so the `npm` environment is where to require a reviewer.
+#
+# Run the workflow by hand (Actions > Release > Run workflow) with an existing tag to publish
+# that tag's GitHub Release to npm, for example after turning publishing on. It builds nothing:
+# it publishes the tarball already attached to the release.
+#
+# Consumers can also pin the release tarball instead of the registry:
+#   "@vibeforge-systems/amqp-mcp-edge": "https://github.com/VibeForge-Systems/amqp-mcp-edge/releases/download/vX.Y.Z/vibeforge-systems-amqp-mcp-edge-X.Y.Z.tgz"
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "An existing release tag to publish to npm, such as v0.1.0"
+        required: true
+        type: string
+
+permissions: {}
+
+# One release per tag at a time, and never cancel one halfway.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.preflight.outputs.version }}
+      tarball: ${{ steps.preflight.outputs.tarball }}
+      prerelease: ${{ steps.preflight.outputs.prerelease }}
+
+    services:
+      rabbitmq:
+        image: rabbitmq:4-management
+        ports:
+          - 5672:5672
+          - 15672:15672
+        env:
+          RABBITMQ_DEFAULT_USER: mcp
+          RABBITMQ_DEFAULT_PASS: discovery
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.x
+          # No `cache:` on the release path: a poisoned dependency cache would ship in the tarball.
+
+      # The tag must be v + package.json's version, with a dated CHANGELOG section.
+      - id: preflight
+        run: node scripts/release-preflight.mjs "${GITHUB_REF_NAME}" --notes release-notes.md >> "$GITHUB_OUTPUT"
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:unit
+      - run: npm run test:integration
+        env:
+          AMQP_INTEGRATION_URL: amqp://mcp:discovery@127.0.0.1:5672
+          AMQP_INTEGRATION_MANAGEMENT_URL: http://127.0.0.1:15672
+          AMQP_INTEGRATION_REQUIRE_MANAGEMENT: '1'
+
+      - name: Build and pack
+        env:
+          TARBALL: ${{ steps.preflight.outputs.tarball }}
+        run: |
+          npm run build
+          npm pack
+          test -f "${TARBALL}"
+          sha256sum "${TARBALL}" > "${TARBALL}.sha256"
+          cat "${TARBALL}.sha256"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: |
+            ${{ steps.preflight.outputs.tarball }}
+            ${{ steps.preflight.outputs.tarball }}.sha256
+            release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Creating the GitHub Release is the only write in this workflow.
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARBALL: ${{ needs.build.outputs.tarball }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          sha256sum -c "${TARBALL}.sha256"
+          flags=()
+          if [ "${PRERELEASE}" = "true" ]; then flags+=(--prerelease); fi
+          gh release create "${GITHUB_REF_NAME}" "${TARBALL}" "${TARBALL}.sha256" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md \
+            --verify-tag \
+            "${flags[@]}"
+
+  # Decides, without any token, whether the npm job runs, and says why it does not.
+  npm-gate:
+    needs: release
+    if: ${{ !cancelled() && (needs.release.result == 'success' || (github.event_name == 'workflow_dispatch' && needs.release.result == 'skipped')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+      tag: ${{ steps.mode.outputs.tag }}
+    steps:
+      - id: mode
+        env:
+          NPM_PUBLISH: ${{ vars.NPM_PUBLISH }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          case "${TAG}" in
+            v[0-9]*) ;;
+            *) echo "::error::${TAG} is not a release tag"; exit 1 ;;
+          esac
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          case "${NPM_PUBLISH}" in
+            token|trusted)
+              echo "mode=${NPM_PUBLISH}" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "mode=" >> "$GITHUB_OUTPUT"
+              {
+                echo "### npm publish skipped"
+                echo
+                echo "The repository variable \`NPM_PUBLISH\` is not \`token\` or \`trusted\`, so ${TAG} was not published to npm."
+                echo "Set it (see docs/RELEASE_POLICY.md), then run this workflow by hand with the tag ${TAG}."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::notice::npm publish skipped: NPM_PUBLISH is not set"
+              ;;
+          esac
+
+  npm:
+    needs: npm-gate
+    if: ${{ !cancelled() && needs.npm-gate.result == 'success' && needs.npm-gate.outputs.mode != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm
+    # id-token: write lets npm sign the provenance statement, and authenticate in trusted mode.
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.x
+          registry-url: "https://registry.npmjs.org"
+          # No `cache:` on the publish path.
+
+      # Trusted publishing needs npm 11.5.1 or later; Node 22 bundles npm 10.
+      - name: Use npm 11
+        if: needs.npm-gate.outputs.mode == 'trusted'
+        run: |
+          npm install --global npm@11.21.1
+          npm --version
+
+      - name: Download the release tarball and check it
+        id: tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.npm-gate.outputs.tag }}
+        run: |
+          version="${TAG#v}"
+          tarball="vibeforge-systems-amqp-mcp-edge-${version}.tgz"
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --pattern "${tarball}" --pattern "${tarball}.sha256"
+          sha256sum -c "${tarball}.sha256"
+          # The tarball must hold this package at this version.
+          packed="$(tar -xzOf "${tarball}" package/package.json | node -p 'const p = JSON.parse(require("fs").readFileSync(0, "utf8")); p.name + "@" + p.version')"
+          if [ "${packed}" != "@vibeforge-systems/amqp-mcp-edge@${version}" ]; then
+            echo "::error::the tarball holds ${packed}, not @vibeforge-systems/amqp-mcp-edge@${version}"
+            exit 1
+          fi
+          case "${version}" in
+            *-*) dist_tag=next ;;
+            *) dist_tag=latest ;;
+          esac
+          if npm view "@vibeforge-systems/amqp-mcp-edge@${version}" version > /dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::@vibeforge-systems/amqp-mcp-edge@${version} is already on npm; nothing to publish"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=${dist_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish with NPM_TOKEN
+        if: needs.npm-gate.outputs.mode == 'token' && steps.tarball.outputs.published == 'false'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TARBALL: ${{ steps.tarball.outputs.tarball }}
+          DIST_TAG: ${{ steps.tarball.outputs.dist_tag }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "::error::NPM_PUBLISH is token, but the NPM_TOKEN secret is not set for the npm environment or the repository"
+            exit 1
+          fi
+          npm publish "./${TARBALL}" --provenance --access public --tag "${DIST_TAG}"
+
+      # npm exchanges the job's OIDC token for a short-lived publish token; no secret is used.
+      - name: Publish with trusted publishing
+        if: needs.npm-gate.outputs.mode == 'trusted' && steps.tarball.outputs.published == 'false'
+        env:
+          TARBALL: ${{ steps.tarball.outputs.tarball }}
+          DIST_TAG: ${{ steps.tarball.outputs.dist_tag }}
+        run: npm publish "./${TARBALL}" --provenance --access public --tag "${DIST_TAG}"
