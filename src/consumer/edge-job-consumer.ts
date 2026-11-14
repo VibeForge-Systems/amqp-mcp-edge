@@ -37,8 +37,57 @@ interface PendingDelivery {
 // first. A forgotten count only means a later delivery is counted from the broker's flags again.
 const maxTrackedAttempts = 10_000;
 
-// Room for the handler's error in the failure event, which a control plane may show to people.
-const maxReportedErrorLength = 1000;
+/** The most characters of an opted-in error description a failure event carries. */
+export const maxHandlerErrorDescriptionLength = 1000;
+
+// An error's class name is sent only when it looks like one, so a name cannot carry other text.
+const errorNamePattern = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+
+/**
+ * What a failure event says about the handler's error: always the stable code `HANDLER_ERROR`;
+ * the error's class name when it is a plain identifier; and a description only when the node opts
+ * in with `describeHandlerError`, cut to `maxHandlerErrorDescriptionLength` characters. The
+ * handler's own message is never sent by default: error messages often carry connection strings,
+ * signed URLs, file paths or other secrets.
+ */
+export function describeHandlerErrorForEvent(
+  error: unknown,
+  describe?: (error: unknown) => string | undefined,
+): { code: string; name?: string; description?: string } {
+  const summary: { code: string; name?: string; description?: string } = { code: edgeFailureCodes.handlerError };
+  const name = error instanceof Error ? error.name : undefined;
+
+  if (typeof name === 'string' && errorNamePattern.test(name)) {
+    summary.name = name;
+  }
+
+  if (describe) {
+    let description: unknown;
+
+    try {
+      description = describe(error);
+    } catch {
+      // A describer that throws adds nothing; it must not stop the report or the dead-lettering.
+      description = undefined;
+    }
+
+    if (typeof description === 'string' && description.length > 0) {
+      summary.description = truncate(description, maxHandlerErrorDescriptionLength);
+    }
+  }
+
+  return summary;
+}
+
+function truncate(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  // Never end on the first half of a surrogate pair.
+  const end = /[\uD800-\uDBFF]/.test(value.charAt(maxLength - 1)) ? maxLength - 1 : maxLength;
+  return value.slice(0, end);
+}
 
 export type EdgeJobHandler = (job: ExecutionJobEnvelope, context: JobDeliveryContext) => Promise<void>;
 
@@ -56,14 +105,14 @@ export interface EdgeJobConsumer {
  * attempt. Shared with the mock channel, so tests see the same event.
  */
 export function createExhaustedFailureEvent(
-  config: Pick<ResolvedEdgeChannelConfig, 'maxDeliveryAttempts' | 'producer' | 'siteId'>,
+  config: Pick<ResolvedEdgeChannelConfig, 'maxDeliveryAttempts' | 'producer' | 'siteId' | 'describeHandlerError'>,
   nodeId: string,
   job: ExecutionJobEnvelope,
   deliveryAttempt: number,
-  reason: string,
+  error: unknown,
 ): JobFailureEvent {
   const { maxDeliveryAttempts } = config;
-  const handlerError = reason.length > maxReportedErrorLength ? `${reason.slice(0, maxReportedErrorLength)}…` : reason;
+  const handlerError = describeHandlerErrorForEvent(error, config.describeHandlerError);
   const now = new Date().toISOString();
 
   return {
@@ -377,16 +426,14 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
         return;
       }
 
-      const reason = error instanceof Error ? error.message : String(error);
-
       if (deliveryAttempt < this.config.maxDeliveryAttempts) {
-        await this.nack(context, { requeue: true, reason });
+        await this.nack(context, { requeue: true });
         return;
       }
 
       // The last attempt: tell the control plane before the job leaves for the dead-letter queue.
-      await this.reportExhausted(envelope, deliveryAttempt, reason);
-      await this.nack(context, { requeue: false, reason });
+      await this.reportExhausted(envelope, deliveryAttempt, error);
+      await this.nack(context, { requeue: false });
     }
   }
 
@@ -417,7 +464,7 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
     }
   }
 
-  private async reportExhausted(job: ExecutionJobEnvelope, deliveryAttempt: number, reason: string): Promise<void> {
+  private async reportExhausted(job: ExecutionJobEnvelope, deliveryAttempt: number, error: unknown): Promise<void> {
     const recordError = (message: string) => {
       this.failureReportErrors += 1;
       this.lastFailureReportError = message;
@@ -435,7 +482,7 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
 
     try {
       await this.failurePublisher.publishFailure(
-        createExhaustedFailureEvent(this.config, this.config.nodeId, job, deliveryAttempt, reason),
+        createExhaustedFailureEvent(this.config, this.config.nodeId, job, deliveryAttempt, error),
       );
     } catch (error) {
       // The job is dead-lettered regardless: requeueing it would start the loop this exists to end.

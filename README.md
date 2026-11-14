@@ -164,6 +164,7 @@ await channel.consumer.start();
 | `consumerTag` | assigned by the broker | Consumer tag for the subscription |
 | `prefetchCount` | `1` | Unacknowledged jobs the broker delivers at a time |
 | `maxDeliveryAttempts` | `2` | Deliveries of a job whose handler throws, the first included. After the last, the consumer publishes `execution.failure` (`DELIVERY_ATTEMPTS_EXHAUSTED`, `retryable: false`) and dead-letters the job |
+| `describeHandlerError` | — | Opt-in. That failure carries only the code `HANDLER_ERROR` and the error's class name, never the handler's message; set this to send a description, cut to 1000 characters. Keep credentials out of what it returns |
 | `producer` | this library's name and version | The `producer` of events the library publishes itself, such as that failure |
 | `maxMessageSizeBytes` | `1048576` | Larger jobs are rejected without requeue |
 | `runtimeConsumerVersion` | — | Checked against a job's `compatibility.minConsumerVersion` |

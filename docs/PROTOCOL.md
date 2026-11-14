@@ -432,8 +432,15 @@ dead-lettered, so one bad job cannot hold a node's queue.
   `maxDeliveryAttempts`, the consumer publishes an `execution.failure` and then rejects the job
   without requeue, which dead-letters it. The failure has code `DELIVERY_ATTEMPTS_EXHAUSTED`,
   `retryable: false`, the job's `jobId` and `attemptId`, the node's `siteId` and `nodeId`, and
-  `details: { deliveryAttempt, maxDeliveryAttempts, handlerError }`, with the handler's error
-  message cut to 1000 characters.
+  `details: { deliveryAttempt, maxDeliveryAttempts, handlerError }`.
+- **`handlerError` carries a code, not the handler's message.** It is
+  `{ code: 'HANDLER_ERROR', name?, description? }`. `name` is the error's class name, such as
+  `TypeError`, sent only when it is a plain identifier of at most 64 characters. The error's
+  message is never sent by default, because error messages often carry connection strings,
+  signed URLs, file paths or other secrets, and a node may run on infrastructure its operator does
+  not control. A control plane must not expect error text. A node opts in with the
+  `describeHandlerError` option, a function whose result is sent as `description`, cut to 1000
+  characters; the node is then responsible for keeping credentials out of it.
 - **The job is dead-lettered even if that failure cannot be published**, for example when the
   config has no `nodeId` or the broker refuses the event: requeueing it would restart the loop.
   The consumer's `health()` then reports `failureReportErrors` and `lastFailureReportError`.

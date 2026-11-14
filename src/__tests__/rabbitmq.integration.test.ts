@@ -1272,7 +1272,10 @@ test('least privilege: node.hello, node.heartbeat and a package.install job roun
   assert.equal(heartbeat.payload.sessionId, hello.payload.sessionId);
 });
 
+// The classic run uses the default failure report (no error text); the quorum run opts in to a
+// description, which must arrive cut to 1000 characters.
 for (const queueType of ['classic', 'quorum'] as const) {
+  const describes = queueType === 'quorum';
   test(`poison job on a ${queueType} queue: delivered maxDeliveryAttempts times, reported, dead-lettered, and the next job runs`, { timeout: 60000 }, async (t) => {
     const api = await managementApiOrSkip(t);
     if (!api) {
@@ -1289,6 +1292,7 @@ for (const queueType of ['classic', 'quorum'] as const) {
       runtimeConsumerVersion: '0.1.0',
       runtimeProducerVersion: '0.1.0',
       connectionName: `amqp-mcp-edge-poison-${queueType}-${harness.runId}`,
+      ...(describes ? { describeHandlerError: (error: unknown) => `${(error as Error).message} `.repeat(100) } : {}),
     });
     harness.cleanup.defer(() => edgeChannel.close());
 
@@ -1297,7 +1301,7 @@ for (const queueType of ['classic', 'quorum'] as const) {
       deliveries.push({ jobId: job.payload.jobId, deliveryAttempt: delivery.deliveryAttempt, redelivered: delivery.redelivered });
 
       if (job.payload.jobId.startsWith('poison-')) {
-        throw new Error('handler bug: cannot process this job');
+        throw new TypeError('handler bug: cannot reach amqp://node:s3cret@broker.internal');
       }
 
       await edgeChannel.publisher.publishResult(
@@ -1342,7 +1346,17 @@ for (const queueType of ['classic', 'quorum'] as const) {
     assert.equal(failure.payload.code, edgeFailureCodes.deliveryAttemptsExhausted);
     assert.equal(failure.payload.retryable, false);
     assert.equal(failure.payload.nodeId, harness.nodeId);
-    assert.equal(failure.payload.details?.handlerError, 'handler bug: cannot process this job');
+    const handlerError = failure.payload.details?.handlerError as { code?: string; name?: string; description?: string } | undefined;
+    assert.equal(handlerError?.code, 'HANDLER_ERROR');
+    assert.equal(handlerError?.name, 'TypeError');
+    if (describes) {
+      // The opted-in description, cut to 1000 characters.
+      assert.equal(handlerError?.description?.length, 1000);
+      assert.ok(handlerError?.description?.startsWith('handler bug: cannot reach'));
+    } else {
+      assert.equal(handlerError?.description, undefined);
+      assert.ok(!JSON.stringify(failure).includes('s3cret'), 'the default failure event carries the handler error text');
+    }
     assert.ok(result?.messageType === 'execution.result');
     assert.equal(result.payload.jobId, `good-${harness.runId}`);
 

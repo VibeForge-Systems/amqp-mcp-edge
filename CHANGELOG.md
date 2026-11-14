@@ -55,10 +55,12 @@ follows [Semantic Versioning](https://semver.org/). Version 0.1.0 has not been p
 - `maxDeliveryAttempts` config option (default 2) and `deliveryAttempt` on each delivery's
   context. A job whose handler throws is requeued until its last attempt; on that attempt the
   consumer publishes `execution.failure` with the new code `DELIVERY_ATTEMPTS_EXHAUSTED` and
-  `retryable: false`, then rejects it without requeue, which dead-letters it. The `producer`
-  config option names the producer of that event. `EdgeJobConsumer` takes the publisher it reports
-  through as a third constructor argument, which `createEdgeChannel` passes. The mock channel does
-  the same
+  `retryable: false`, then rejects it without requeue, which dead-letters it. The event's
+  `details.handlerError` carries the code `HANDLER_ERROR` and the error's class name, not the
+  handler's message; the opt-in `describeHandlerError` option adds a description, cut to
+  `maxHandlerErrorDescriptionLength` (1000) characters. The `producer` config option names the
+  producer of that event. `EdgeJobConsumer` takes the publisher it reports through as a third
+  constructor argument, which `createEdgeChannel` passes. The mock channel does the same
 - `checkEventIdentity`, which applies the node-identity rules to a delivered event for a control
   plane, and `parseEventRoutingKey`, `buildNodeKey`, `sanitizeRoutingSegment` and
   `eventRoutingTypes`

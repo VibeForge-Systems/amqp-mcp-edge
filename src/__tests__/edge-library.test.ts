@@ -26,6 +26,7 @@ import {
   EdgeTopologyError,
   EdgeUnsupportedMessageTypeError,
   eventRoutingTypes,
+  maxHandlerErrorDescriptionLength,
   isPackageInstallJob,
   isToolJob,
   packageInstallResultOutputSchema,
@@ -1529,7 +1530,9 @@ test('a handler that always throws is requeued once by default, then reported an
   assert.equal(failure?.payload.attemptId, 'attempt-1');
   assert.equal(failure?.payload.siteId, 'site-a');
   assert.equal(failure?.payload.nodeId, 'node-1');
-  assert.deepEqual(failure?.payload.details, { deliveryAttempt: 2, maxDeliveryAttempts: 2, handlerError: 'handler bug' });
+  // A code and the error's class name; the handler's message is not sent by default.
+  assert.deepEqual(failure?.payload.details, { deliveryAttempt: 2, maxDeliveryAttempts: 2, handlerError: { code: 'HANDLER_ERROR', name: 'Error' } });
+  assert.ok(!JSON.stringify(failure).includes('handler bug'), 'the failure event carries the handler error message');
   assert.deepEqual(failure?.producer, { service: edgeLibraryName, version: edgeLibraryVersion });
   assert.equal((await consumer.health()).details?.pendingDeliveries, 0);
   await consumer.stop();
@@ -1676,22 +1679,78 @@ test('validateConfig checks maxDeliveryAttempts and producer, and the failure us
   await consumer.stop();
 });
 
-test('the failure event truncates a long handler error', async () => {
+// Runs one job whose handler throws `thrown` on its only attempt, and returns the failure's details.
+async function reportedHandlerError(thrown: unknown, config: Partial<Parameters<typeof resolveConfig>[0]> = {}) {
   const channel = new FakeConsumerChannel();
   const publisher = new RecordingFailurePublisher();
   const consumer = new EdgeJobConsumer(
-    { amqpUrl: 'amqp://test.local', siteId: 'site-a', nodeId: 'node-1', runtimeConsumerVersion: '0.1.0', maxDeliveryAttempts: 1 },
+    { amqpUrl: 'amqp://test.local', siteId: 'site-a', nodeId: 'node-1', runtimeConsumerVersion: '0.1.0', maxDeliveryAttempts: 1, ...config },
     new FakeConsumerConnectionManager(channel) as never,
     { failurePublisher: publisher },
   );
   consumer.onJob(async () => {
-    throw new Error('x'.repeat(5000));
+    throw thrown;
   });
   await consumer.start();
   channel.emitMessage(jobDelivery(1, false));
   await settle();
-  assert.equal(String(publisher.failures[0]?.payload.details?.handlerError).length, 1001);
   await consumer.stop();
+  assert.deepEqual(channel.settlements, ['nack 1 requeue=false']);
+  const [failure] = publisher.failures;
+  assert.ok(failure);
+  return { failure, handlerError: failure.payload.details?.handlerError as { code: string; name?: string; description?: string } };
+}
+
+test('by default the failure event carries no handler error text, only a code and a class name', async () => {
+  const secret = 'connect ECONNREFUSED amqp://node-1:s3cret@broker.internal:5672 at /srv/edge/secrets.json?token=abc';
+
+  class PackageStoreError extends Error {
+    public override name = 'PackageStoreError';
+  }
+
+  const cases: Array<[label: string, thrown: unknown, expected: { code: string; name?: string }]> = [
+    ['an Error', new Error(secret), { code: 'HANDLER_ERROR', name: 'Error' }],
+    ['a subclass', new PackageStoreError(secret), { code: 'HANDLER_ERROR', name: 'PackageStoreError' }],
+    ['a TypeError', new TypeError(secret), { code: 'HANDLER_ERROR', name: 'TypeError' }],
+    // A name that is not a plain identifier could carry text of its own, so it is left out.
+    ['a name with text in it', Object.assign(new Error(secret), { name: `Error: ${secret}` }), { code: 'HANDLER_ERROR' }],
+    ['a thrown string', secret, { code: 'HANDLER_ERROR' }],
+    ['a thrown object', { message: secret }, { code: 'HANDLER_ERROR' }],
+  ];
+
+  for (const [label, thrown, expected] of cases) {
+    const { failure, handlerError } = await reportedHandlerError(thrown);
+    assert.deepEqual(handlerError, expected, label);
+    const wire = JSON.stringify(failure);
+    for (const fragment of ['s3cret', 'broker.internal', '/srv/edge', 'token=abc', 'ECONNREFUSED']) {
+      assert.ok(!wire.includes(fragment), `${label}: the failure event carries '${fragment}'`);
+    }
+  }
+});
+
+test('describeHandlerError opts in to a description, cut to maxHandlerErrorDescriptionLength', async () => {
+  assert.equal(maxHandlerErrorDescriptionLength, 1000);
+
+  const short = await reportedHandlerError(new Error('disk full'), { describeHandlerError: (error) => `cannot write: ${(error as Error).message}` });
+  assert.deepEqual(short.handlerError, { code: 'HANDLER_ERROR', name: 'Error', description: 'cannot write: disk full' });
+
+  const long = await reportedHandlerError(new Error('x'), { describeHandlerError: () => 'y'.repeat(5000) });
+  assert.equal(long.handlerError.description, 'y'.repeat(1000));
+
+  // The cut never leaves half of a surrogate pair.
+  const emoji = await reportedHandlerError(new Error('x'), { describeHandlerError: () => `${'y'.repeat(999)}\u{1F600}tail` });
+  assert.equal(emoji.handlerError.description, 'y'.repeat(999));
+
+  // A describer that returns nothing, an empty string or a non-string adds nothing, and one that
+  // throws does not stop the report.
+  for (const describeHandlerError of [() => undefined, () => '', () => 42 as unknown as string, () => {
+    throw new Error('describer bug');
+  }]) {
+    const { handlerError } = await reportedHandlerError(new Error('x'), { describeHandlerError });
+    assert.deepEqual(handlerError, { code: 'HANDLER_ERROR', name: 'Error' });
+  }
+
+  assert.deepEqual(validateConfig({ amqpUrl: 'amqp://test.local', describeHandlerError: 'yes' as never }), ['describeHandlerError must be a function']);
 });
 
 test('mock edge channel requeues a throwing handler until the last attempt, then reports and dead-letters it', async () => {

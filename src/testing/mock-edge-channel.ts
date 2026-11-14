@@ -123,9 +123,8 @@ class MockEdgeJobConsumer {
         const lastAttempt = (context.deliveryAttempt ?? 1) >= this.config.maxDeliveryAttempts;
 
         if (lastAttempt && this.config.nodeId) {
-          const reason = error instanceof Error ? error.message : String(error);
           await this.publisher.publishFailure(
-            createExhaustedFailureEvent(this.config, this.config.nodeId, validatedEnvelope, context.deliveryAttempt ?? 1, reason),
+            createExhaustedFailureEvent(this.config, this.config.nodeId, validatedEnvelope, context.deliveryAttempt ?? 1, error),
           );
         }
 

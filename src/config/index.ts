@@ -79,6 +79,14 @@ export interface EdgeChannelConfig {
    */
   maxDeliveryAttempts?: number;
   /**
+   * Opt-in: describes a handler's error for the failure event above. By default that event carries
+   * only the code `HANDLER_ERROR` and the error's class name, never the error's message, which
+   * often holds connection strings, signed URLs, paths or other secrets. When set, its result is
+   * sent as `details.handlerError.description`, cut to 1000 characters; return `undefined` to send
+   * none. Keep credentials out of what it returns.
+   */
+  describeHandlerError?: (error: unknown) => string | undefined;
+  /**
    * The `producer` of events the library publishes on its own, such as the failure above.
    * Defaults to this library's name and version.
    */
@@ -407,6 +415,10 @@ export function validateConfig(config: EdgeChannelConfig): string[] {
     (!Number.isSafeInteger(config.maxDeliveryAttempts) || config.maxDeliveryAttempts <= 0)
   ) {
     errors.push('maxDeliveryAttempts must be a positive integer');
+  }
+
+  if (config.describeHandlerError !== undefined && typeof config.describeHandlerError !== 'function') {
+    errors.push('describeHandlerError must be a function');
   }
 
   if (config.producer !== undefined) {

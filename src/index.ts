@@ -97,7 +97,7 @@ export {
 } from './contracts/index.js';
 
 export type { EdgeJobConsumerOptions, EdgeJobHandler, JobDeliveryContext } from './consumer/index.js';
-export { EdgeJobConsumer } from './consumer/index.js';
+export { EdgeJobConsumer, maxHandlerErrorDescriptionLength } from './consumer/index.js';
 export { EdgeEventPublisher } from './publisher/index.js';
 
 export type { EdgeChannel } from './connection/index.js';
