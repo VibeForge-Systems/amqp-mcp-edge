@@ -516,6 +516,28 @@ Rules:
 character outside `a-z 0-9 - _` replaced by `-`. Site `Site A` and node `node.1` become `site-a`
 and `node-1`. Permission patterns (below) must use the sanitized form.
 
+## Publishing Guarantees
+
+A node publishes every event as a persistent message on a confirm channel, and a publish
+resolves only once the broker confirms it. For a persistent message routed to durable queues,
+RabbitMQ confirms after every one of those queues has taken it. A publish rejects with an
+`EdgePublishError` when the broker nacks the event (`reason: 'nacked'`), when the channel closes
+before the confirm (`'channel-closed'`), or when no confirm arrives within `confirmTimeoutMs`
+(`'timeout'`).
+
+- **A node acks a job only after the events that report it are confirmed.** Publish the result
+  (or failure), await it, then ack. If the publish rejects, do not ack: the job is redelivered, or
+  dead-lettered after its last attempt (see [Delivery Attempts](#delivery-attempts)), instead of
+  being acked with an outcome the control plane never received.
+- **A rejected publish may still have been delivered.** A nack means the broker did not take
+  responsibility for the event everywhere it was routed; with several queues bound, some may
+  have it. A timeout or a closed channel leaves the same doubt. A node that publishes again
+  produces a duplicate, so a consumer of `mcp.edge.events` deduplicates by `messageId`, and by
+  `jobId` and `attemptId` for outcomes.
+- **An event no binding matches is confirmed and dropped.** The library does not publish with
+  `mandatory`, so the platform binds its event queues before any node starts (see
+  [Broker Topology](#broker-topology)).
+
 ## Broker Topology
 
 The control plane owns the broker topology. Edge nodes run in networks the control plane does not

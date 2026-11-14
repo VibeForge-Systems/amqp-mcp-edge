@@ -98,7 +98,7 @@ export {
 
 export type { EdgeJobConsumerOptions, EdgeJobHandler, JobDeliveryContext } from './consumer/index.js';
 export { EdgeJobConsumer, maxHandlerErrorDescriptionLength } from './consumer/index.js';
-export { EdgeEventPublisher } from './publisher/index.js';
+export { EdgeEventPublisher, EdgePublishError } from './publisher/index.js';
 
 export type { EdgeChannel } from './connection/index.js';
 export { createEdgeChannel, EdgeChannelConnectionManager } from './connection/index.js';

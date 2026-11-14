@@ -23,6 +23,7 @@ import {
   EdgeConventionError,
   EdgeEventPublisher,
   EdgeJobConsumer,
+  EdgePublishError,
   EdgeTopologyError,
   EdgeUnsupportedMessageTypeError,
   eventRoutingTypes,
@@ -242,6 +243,9 @@ class FakeConsumerConnectionManager {
   }
 }
 
+// How the fake broker answers a publish on the confirm channel, as amqplib reports it to the callback.
+type FakeConfirm = 'ack' | 'nack' | 'close' | 'never' | 'throw';
+
 class FakePublisherChannel extends EventEmitter {
   public publishCalls = 0;
 
@@ -249,7 +253,10 @@ class FakePublisherChannel extends EventEmitter {
 
   public readonly published: Array<{ exchange: string; routingKey: string; content: Buffer; options: Record<string, unknown> }> = [];
 
-  public constructor(private readonly accepted: boolean) {
+  public constructor(
+    private readonly accepted: boolean,
+    public confirm: FakeConfirm | ((routingKey: string) => FakeConfirm) = 'ack',
+  ) {
     super();
   }
 
@@ -257,9 +264,24 @@ class FakePublisherChannel extends EventEmitter {
     this.assertExchangeCalls += 1;
   }
 
-  public publish(exchange: string, routingKey: string, content: Buffer, options: Record<string, unknown>): boolean {
+  public publish(exchange: string, routingKey: string, content: Buffer, options: Record<string, unknown>, callback?: (error: Error | null) => void): boolean {
+    const confirm = typeof this.confirm === 'function' ? this.confirm(routingKey) : this.confirm;
+
+    if (confirm === 'throw') {
+      throw new Error('Channel closed');
+    }
+
     this.publishCalls += 1;
     this.published.push({ exchange, routingKey, content, options });
+    setImmediate(() => {
+      if (confirm === 'ack') {
+        callback?.(null);
+      } else if (confirm === 'nack') {
+        callback?.(new Error('message nacked'));
+      } else if (confirm === 'close') {
+        callback?.(new Error('channel closed'));
+      }
+    });
     return this.accepted;
   }
 }
@@ -1772,4 +1794,101 @@ test('mock edge channel requeues a throwing handler until the last attempt, then
   assert.equal(event.message.payload.code, 'DELIVERY_ATTEMPTS_EXHAUSTED');
   assert.equal(event.message.payload.retryable, false);
   await channel.close();
+});
+
+// --- Publisher confirms ---------------------------------------------------------------------------
+
+test('every publish waits for the broker confirm before it resolves', async () => {
+  const channel = new FakePublisherChannel(true, 'never');
+  const publisher = new EdgeEventPublisher({ amqpUrl: 'amqp://node-1:secret@broker.example.com', confirmTimeoutMs: 1000 }, new FakePublisherConnectionManager(channel) as never);
+  let resolved = false;
+  const publishing = publisher.publishResult(createResultMessage()).then(() => {
+    resolved = true;
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(channel.publishCalls, 1);
+  assert.equal(resolved, false, 'the publish resolved before the broker confirmed it');
+  assert.equal((await publisher.health()).publisherActive, false);
+
+  channel.confirm = 'ack';
+  await assert.rejects(publishing, (error: unknown) => error instanceof EdgePublishError && error.reason === 'timeout');
+});
+
+test('a nacked, unconfirmed or refused publish rejects with an EdgePublishError naming the event', async () => {
+  const cases: Array<[confirm: FakeConfirm, reason: EdgePublishError['reason'], text: RegExp]> = [
+    ['nack', 'nacked', /the broker nacked execution\.result result-message-1; treat it as not delivered/],
+    ['close', 'channel-closed', /the channel closed before the broker confirmed execution\.result result-message-1/],
+    ['never', 'timeout', /did not confirm execution\.result result-message-1 within 30ms/],
+    ['throw', 'channel-closed', /could not publish execution\.result result-message-1: Channel closed/],
+  ];
+
+  for (const [confirm, reason, text] of cases) {
+    const channel = new FakePublisherChannel(true, confirm);
+    const publisher = new EdgeEventPublisher({ amqpUrl: 'amqp://node-1:secret@broker.example.com', confirmTimeoutMs: 30 }, new FakePublisherConnectionManager(channel) as never);
+
+    await assert.rejects(
+      () => publisher.publishResult(createResultMessage()),
+      (error: unknown) => {
+        assert.ok(error instanceof EdgePublishError, confirm);
+        assert.equal(error.reason, reason, confirm);
+        assert.equal(error.messageType, 'execution.result', confirm);
+        assert.equal(error.messageId, 'result-message-1', confirm);
+        assert.match(error.message, text, confirm);
+        return true;
+      },
+    );
+    assert.equal((await publisher.health()).publisherActive, false, confirm);
+  }
+
+  assert.deepEqual(validateConfig({ amqpUrl: 'amqp://test.local', confirmTimeoutMs: 0 }), ['confirmTimeoutMs must be a positive integer']);
+  assert.equal(resolveConfig({ amqpUrl: 'amqp://test.local' }).confirmTimeoutMs, 10000);
+});
+
+test('under backpressure a publish waits for both the drain and the confirm', async () => {
+  const channel = new FakePublisherChannel(false, 'nack');
+  const publisher = new EdgeEventPublisher({ amqpUrl: 'amqp://node-1:secret@broker.example.com', backpressureTimeoutMs: 200 }, new FakePublisherConnectionManager(channel) as never);
+  const publishing = publisher.publishAck(createAckMessage());
+  setTimeout(() => channel.emit('drain'), 20);
+  // The channel drained, but the broker nacked the event: the publish still fails.
+  await assert.rejects(publishing, (error: unknown) => error instanceof EdgePublishError && error.reason === 'nacked');
+});
+
+test('a worker whose result publish is nacked does not ack the job: it is requeued, then reported and dead-lettered', async () => {
+  const consumerChannel = new FakeConsumerChannel();
+  // The broker nacks results and accepts the failure report.
+  const publisherChannel = new FakePublisherChannel(true, (routingKey) => (routingKey.startsWith('edge.event.result.') ? 'nack' : 'ack'));
+  const config = { amqpUrl: 'amqp://node-1:secret@broker.example.com', siteId: 'site-a', nodeId: 'node-1', runtimeConsumerVersion: '0.1.0' };
+  const publisher = new EdgeEventPublisher(config, new FakePublisherConnectionManager(publisherChannel) as never);
+  const consumer = new EdgeJobConsumer(config, new FakeConsumerConnectionManager(consumerChannel) as never, { failurePublisher: publisher });
+  const publishErrors: unknown[] = [];
+
+  consumer.onJob(async (_job, delivery) => {
+    try {
+      await publisher.publishResult(createResultMessage());
+    } catch (error) {
+      publishErrors.push(error);
+      throw error;
+    }
+    await consumer.ack(delivery);
+  });
+  await consumer.start();
+
+  consumerChannel.emitMessage(jobDelivery(1, false));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  consumerChannel.emitMessage(jobDelivery(2, true));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.deepEqual(consumerChannel.settlements, ['nack 1 requeue=true', 'nack 2 requeue=false']);
+  assert.equal(publishErrors.length, 2);
+  assert.ok(publishErrors.every((error) => error instanceof EdgePublishError && error.reason === 'nacked'));
+  assert.deepEqual(publisherChannel.published.map((entry) => entry.routingKey), [
+    'edge.event.result.site-a.node-1',
+    'edge.event.result.site-a.node-1',
+    'edge.event.failure.site-a.node-1',
+  ]);
+  const failure = JSON.parse(publisherChannel.published[2]!.content.toString('utf8')) as JobFailureEvent;
+  assert.equal(failure.payload.code, 'DELIVERY_ATTEMPTS_EXHAUSTED');
+  assert.deepEqual(failure.payload.details?.handlerError, { code: 'HANDLER_ERROR', name: 'EdgePublishError' });
+  await consumer.stop();
 });

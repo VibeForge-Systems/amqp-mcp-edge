@@ -1,5 +1,5 @@
 import { connect } from 'amqplib';
-import type { Channel, ChannelModel, Options } from 'amqplib';
+import type { Channel, ChannelModel, ConfirmChannel, Options } from 'amqplib';
 
 import type { EdgeChannelConfig } from '../config/index.js';
 import { resolveConfig } from '../config/index.js';
@@ -12,7 +12,8 @@ export class EdgeChannelConnectionManager {
 
   private consumerChannel?: Channel;
 
-  private publisherChannel?: Channel;
+  // A confirm channel: the broker acks or nacks every publish, and the publisher waits for it.
+  private publisherChannel?: ConfirmChannel;
 
   private connected = false;
 
@@ -62,7 +63,7 @@ export class EdgeChannelConnectionManager {
     return this.consumerChannel;
   }
 
-  public async getPublisherChannel(): Promise<Channel> {
+  public async getPublisherChannel(): Promise<ConfirmChannel> {
     await this.connect();
 
     if (!this.publisherChannel) {
@@ -151,7 +152,7 @@ export class EdgeChannelConnectionManager {
 
     this.connection = connection;
     this.consumerChannel = await connection.createChannel();
-    this.publisherChannel = await connection.createChannel();
+    this.publisherChannel = await connection.createConfirmChannel();
     this.connected = true;
     this.reconnectAttempts = 0;
   }

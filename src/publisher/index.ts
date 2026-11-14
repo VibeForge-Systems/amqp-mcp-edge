@@ -1,1 +1,1 @@
-export { EdgeEventPublisher } from './edge-event-publisher.js';
+export { EdgeEventPublisher, EdgePublishError } from './edge-event-publisher.js';

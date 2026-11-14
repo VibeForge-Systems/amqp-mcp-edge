@@ -18,6 +18,7 @@ import {
   defaultExchangeConfig,
   EdgeChannelConnectionManager,
   EdgeJobConsumer,
+  EdgePublishError,
   EdgeTopologyError,
   packageInstallResultOutputSchema,
   parseEventRoutingKey,
@@ -1377,3 +1378,99 @@ for (const queueType of ['classic', 'quorum'] as const) {
     assert.equal(health.details?.failureReportErrors, undefined);
   });
 }
+
+test('publisher confirms: an event the broker nacks rejects the publish, and the job is never acked', { timeout: 60000 }, async (t) => {
+  const api = await managementApiOrSkip(t);
+  if (!api) {
+    return;
+  }
+
+  const harness = await createLeastPrivilegeHarness(t, api);
+  const { jobsExchange, eventsExchange } = defaultExchangeConfig;
+
+  // The platform binds a queue that refuses every result: x-overflow reject-publish makes the
+  // broker nack a publish it cannot enqueue, which is what a confirm channel reports.
+  const fullQueue = `mcp.edge.full.${harness.siteId}.${harness.nodeId}`;
+  await harness.controlChannel.assertQueue(fullQueue, { durable: true, arguments: { 'x-max-length': 0, 'x-overflow': 'reject-publish' } });
+  harness.cleanup.defer(() => withChannel(harness.controlConnection, (channel) => channel.deleteQueue(fullQueue)));
+  await harness.controlChannel.bindQueue(fullQueue, eventsExchange, `edge.event.result.${harness.siteId}.${harness.nodeId}`);
+
+  const edgeChannel = await createEdgeChannel({
+    amqpUrl: harness.nodeAmqpUrl,
+    siteId: harness.siteId,
+    nodeId: harness.nodeId,
+    topologyMode: 'passive',
+    runtimeConsumerVersion: '0.1.0',
+    runtimeProducerVersion: '0.1.0',
+    connectionName: `amqp-mcp-edge-confirms-${harness.runId}`,
+  });
+  harness.cleanup.defer(() => edgeChannel.close());
+
+  // A plain publish the broker accepts resolves; one it nacks rejects.
+  await edgeChannel.publisher.publishAck(
+    createAckMessage({ messageId: `ack-${harness.runId}`, payload: { ...createAckMessage().payload, siteId: harness.siteId, nodeId: harness.nodeId } }),
+  );
+  await assert.rejects(
+    () => edgeChannel.publisher.publishResult(
+      createResultMessage({ messageId: `direct-result-${harness.runId}`, payload: { ...createResultMessage().payload, siteId: harness.siteId, nodeId: harness.nodeId } }),
+    ),
+    (error: unknown) => error instanceof EdgePublishError && error.reason === 'nacked' && error.messageId === `direct-result-${harness.runId}`,
+  );
+
+  // A worker that acks only after its result is confirmed never acks this job.
+  const publishErrors: unknown[] = [];
+  let acked = 0;
+  edgeChannel.consumer.onJob(async (job, delivery) => {
+    try {
+      await edgeChannel.publisher.publishResult(
+        createResultMessage({
+          messageId: `result-${harness.runId}-${delivery.deliveryAttempt}`,
+          payload: { jobId: job.payload.jobId, attemptId: job.payload.attemptId, siteId: harness.siteId, nodeId: harness.nodeId, completedAt: new Date().toISOString(), output: { ok: true } },
+        }),
+      );
+    } catch (error) {
+      publishErrors.push(error);
+      throw error;
+    }
+    await edgeChannel.consumer.ack(delivery);
+    acked += 1;
+  });
+  await edgeChannel.consumer.start();
+
+  // A nack does not mean no queue got the event: the control queue accepts every result the full
+  // queue refused, which is why a nacked event counts as "maybe delivered" and consumers dedupe
+  // by messageId. It sees the ack, the direct result, one result per attempt, then the failure.
+  const events = collectDeliveries(harness.controlChannel, harness.controlQueueName, 5, 15000);
+  const deadLettered = collectDeliveries(harness.controlChannel, harness.deadLetterQueueName, 1, 15000);
+  const job = createExecutionJob({
+    messageId: `job-${harness.runId}`,
+    payload: { ...createExecutionJob().payload, jobId: `job-${harness.runId}`, attemptId: `attempt-${harness.runId}`, target: { siteId: harness.siteId, nodeId: harness.nodeId } },
+  });
+  harness.controlChannel.publish(jobsExchange, buildJobRoutingKey(job.payload.target, job.payload.capability), Buffer.from(JSON.stringify(job), 'utf8'), {
+    contentType: 'application/json',
+    messageId: job.messageId,
+    userId: harness.adminUser,
+  });
+
+  const received = (await events).map((message) => validateEnvelope(JSON.parse(message.content.toString('utf8'))));
+  assert.deepEqual(received.map((envelope) => [envelope.messageType, envelope.messageId]), [
+    ['execution.ack', `ack-${harness.runId}`],
+    ['execution.result', `direct-result-${harness.runId}`],
+    ['execution.result', `result-${harness.runId}-1`],
+    ['execution.result', `result-${harness.runId}-2`],
+    ['execution.failure', received[4]?.messageId],
+  ]);
+  const failure = received[4];
+  assert.ok(failure?.messageType === 'execution.failure');
+  assert.equal(failure.payload.code, edgeFailureCodes.deliveryAttemptsExhausted);
+  assert.deepEqual(failure.payload.details?.handlerError, { code: 'HANDLER_ERROR', name: 'EdgePublishError' });
+
+  const [deadLetter] = await deadLettered;
+  assert.equal(deadLetter?.properties.messageId, job.messageId);
+  assert.equal(acked, 0);
+  assert.equal(publishErrors.length, 2);
+  assert.ok(publishErrors.every((error) => error instanceof EdgePublishError && error.reason === 'nacked'));
+  // Nothing was enqueued on the refusing queue.
+  const { messageCount } = await withChannel(harness.controlConnection, (channel) => channel.checkQueue(fullQueue));
+  assert.equal(messageCount, 0);
+});

@@ -69,7 +69,7 @@ share a broker.
 | **Runtime validation** | Inbound and outbound envelopes are validated at the boundary |
 | **Compatibility checks** | Rejects jobs whose `minConsumerVersion` the worker does not meet |
 | **Consumer primitive** | Job consumer that declares and binds its queue, or in passive mode only checks it, and re-subscribes after a connection drop |
-| **Publisher primitive** | Event publisher that waits for channel drain under backpressure |
+| **Publisher primitive** | Event publisher on a confirm channel: each publish resolves once the broker confirms the event, and waits for channel drain under backpressure |
 | **Node identity** | Every event carries the broker-validated AMQP `user_id` of the node, and `checkEventIdentity` checks it on the control-plane side |
 | **Node lifecycle** | `node.hello` and `node.heartbeat` events with a capability snapshot (installed packages, runtimes, library version) and its digest |
 | **Job conventions** | Typed deploy jobs (`package.install`: release, signed URL, expected dist hash) and tool jobs, with standard failure codes |
@@ -174,6 +174,7 @@ await channel.consumer.start();
 | `reconnectDelayMs` | `1000` | First reconnect delay; doubles after each failed attempt |
 | `reconnectMaxDelayMs` | `30000` | Upper bound of the reconnect delay |
 | `backpressureTimeoutMs` | `5000` | How long a publish waits for the channel to drain |
+| `confirmTimeoutMs` | `10000` | How long a publish waits for the broker's confirm. Every publish resolves only once the broker confirms the event, and rejects with an `EdgePublishError` if it nacks it, the channel closes first, or this time passes |
 | `routingKeyStrategy` | — | Accepted, but not applied yet: events use the default routing keys |
 
 ### Production settings
@@ -350,8 +351,6 @@ console.log(mock.getPublishedEvents());   // inspect published events
 This is a **0.x** library: the envelope contract (`specVersion: '1.0'`) is stable, but the
 runtime still has gaps that matter for production use. They will be closed before 1.0:
 
-- **No publisher confirms.** Events are published on a plain channel, so a broker-side loss after
-  `publish` returns is not detected.
 - **RabbitMQ 4.x refuses transient non-exclusive queues.** The default consumer queue is durable
   and unaffected. If you pass `consumerQueueOptions` with `durable: false`, also set
   `exclusive: true`; otherwise the broker closes the connection on declare.
@@ -434,6 +433,9 @@ The integration suite covers:
 
 - Full job lifecycle (dispatch → ack → progress → result)
 - Failure + requeue behavior via `nack(..., { requeue: true })`
+- Publisher confirms: an event the broker nacks (a queue with `x-overflow: reject-publish`)
+  rejects the publish with an `EdgePublishError`, and a worker that acks only after its result is
+  confirmed never acks the job
 - A handler that always throws, on a classic and on a quorum queue: the job is delivered
   `maxDeliveryAttempts` times, reported as `DELIVERY_ATTEMPTS_EXHAUSTED`, and dead-lettered, and
   the job queued behind it runs

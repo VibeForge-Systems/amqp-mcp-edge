@@ -61,6 +61,12 @@ follows [Semantic Versioning](https://semver.org/). Version 0.1.0 has not been p
   `maxHandlerErrorDescriptionLength` (1000) characters. The `producer` config option names the
   producer of that event. `EdgeJobConsumer` takes the publisher it reports through as a third
   constructor argument, which `createEdgeChannel` passes. The mock channel does the same
+- publisher confirms: the publisher channel is a confirm channel, and every publish resolves only
+  once the broker confirms the event. It rejects with the new `EdgePublishError` (`reason`
+  `nacked`, `channel-closed` or `timeout`, plus the event's `messageType` and `messageId`) when the
+  broker nacks it, the channel closes first, or no confirm arrives within the new
+  `confirmTimeoutMs` option (default 10000). A worker that acks a job after awaiting its result no
+  longer acks a job whose result the broker lost. `docs/PROTOCOL.md` documents the guarantees
 - `checkEventIdentity`, which applies the node-identity rules to a delivered event for a control
   plane, and `parseEventRoutingKey`, `buildNodeKey`, `sanitizeRoutingSegment` and
   `eventRoutingTypes`

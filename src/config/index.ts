@@ -103,6 +103,12 @@ export interface EdgeChannelConfig {
   reconnectDelayMs?: number;
   reconnectMaxDelayMs?: number;
   backpressureTimeoutMs?: number;
+  /**
+   * How long a publish waits for the broker to confirm the event before it rejects. Defaults to
+   * 10000. The publisher channel is a confirm channel, so every publish resolves only once the
+   * broker has taken responsibility for the event.
+   */
+  confirmTimeoutMs?: number;
   queueNamingStrategy?: QueueNamingStrategy;
   routingKeyStrategy?: RoutingKeyStrategy;
 }
@@ -119,6 +125,7 @@ export interface ResolvedEdgeChannelConfig extends EdgeChannelConfig {
   reconnectDelayMs: number;
   reconnectMaxDelayMs: number;
   backpressureTimeoutMs: number;
+  confirmTimeoutMs: number;
 }
 
 /** The default `maxDeliveryAttempts`: a job whose handler throws is requeued once, then dead-lettered. */
@@ -316,6 +323,7 @@ export function resolveConfig(config: EdgeChannelConfig): ResolvedEdgeChannelCon
     reconnectDelayMs: config.reconnectDelayMs ?? 1000,
     reconnectMaxDelayMs: config.reconnectMaxDelayMs ?? 30_000,
     backpressureTimeoutMs: config.backpressureTimeoutMs ?? 5000,
+    confirmTimeoutMs: config.confirmTimeoutMs ?? 10_000,
   };
 }
 
@@ -464,6 +472,10 @@ export function validateConfig(config: EdgeChannelConfig): string[] {
     (!Number.isInteger(config.backpressureTimeoutMs) || config.backpressureTimeoutMs <= 0)
   ) {
     errors.push('backpressureTimeoutMs must be a positive integer');
+  }
+
+  if (config.confirmTimeoutMs !== undefined && (!Number.isInteger(config.confirmTimeoutMs) || config.confirmTimeoutMs <= 0)) {
+    errors.push('confirmTimeoutMs must be a positive integer');
   }
 
   return errors;

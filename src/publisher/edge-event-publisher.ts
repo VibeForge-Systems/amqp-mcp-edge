@@ -1,4 +1,4 @@
-import type { Channel, Options } from 'amqplib';
+import type { ConfirmChannel, Options } from 'amqplib';
 
 import type { EdgeChannelConfig } from '../config/index.js';
 import { buildRoutingKey, resolveConfig, resolveUserId, validateConfig } from '../config/index.js';
@@ -23,6 +23,30 @@ export interface EdgeEventPublisher {
   publishNodeHello(message: NodeHelloEvent): Promise<void>;
   publishNodeHeartbeat(message: NodeHeartbeatEvent): Promise<void>;
   health(): Promise<EdgeChannelHealth>;
+}
+
+/**
+ * The broker did not confirm an event: it nacked it, the channel closed before the confirm, or
+ * no confirm arrived within `confirmTimeoutMs`. The event may or may not have reached its queues,
+ * so treat it as not delivered: do not ack the job it reports on.
+ */
+export class EdgePublishError extends Error {
+  public readonly reason: 'nacked' | 'channel-closed' | 'timeout';
+
+  public readonly messageType: string;
+
+  public readonly messageId: string;
+
+  public constructor(
+    message: string,
+    details: { reason: 'nacked' | 'channel-closed' | 'timeout'; messageType: string; messageId: string; cause?: unknown },
+  ) {
+    super(message, { cause: details.cause });
+    this.name = 'EdgePublishError';
+    this.reason = details.reason;
+    this.messageType = details.messageType;
+    this.messageId = details.messageId;
+  }
 }
 
 type PublishableEvent =
@@ -150,13 +174,84 @@ export class EdgeEventPublisher implements EdgeEventPublisher {
       userId: this.userId,
     };
 
-    const accepted = channel.publish(this.config.eventsExchange, routingKey, content, publishOptions);
+    await this.publishConfirmed(channel, routingKey, content, publishOptions, validatedMessage);
+    this.publisherActive = true;
+  }
+
+  // Resolves once the broker acks the publish; rejects with an EdgePublishError if it nacks it, if
+  // the channel closes first, or if no confirm arrives in time. Under backpressure it also waits
+  // for the channel to drain, as before.
+  private async publishConfirmed(
+    channel: ConfirmChannel,
+    routingKey: string,
+    content: Buffer,
+    options: Options.Publish,
+    message: PublishableEvent,
+  ): Promise<void> {
+    const { messageType, messageId } = message;
+    const subject = `${messageType} ${messageId}`;
+    let accepted = true;
+
+    const confirmed = new Promise<void>((resolve, reject) => {
+      const timeoutMs = this.config.confirmTimeoutMs;
+      const timer = setTimeout(() => {
+        reject(
+          new EdgePublishError(`the broker did not confirm ${subject} within ${timeoutMs}ms; treat it as not delivered`, {
+            reason: 'timeout',
+            messageType,
+            messageId,
+          }),
+        );
+      }, timeoutMs);
+
+      const onConfirm = (error: unknown) => {
+        clearTimeout(timer);
+
+        if (error === null || error === undefined) {
+          resolve();
+          return;
+        }
+
+        const closed = error instanceof Error && /closed/i.test(error.message);
+        reject(
+          new EdgePublishError(
+            closed
+              ? `the channel closed before the broker confirmed ${subject}; treat it as not delivered`
+              : `the broker nacked ${subject}; treat it as not delivered`,
+            { reason: closed ? 'channel-closed' : 'nacked', messageType, messageId, cause: error },
+          ),
+        );
+      };
+
+      try {
+        accepted = channel.publish(this.config.eventsExchange, routingKey, content, options, onConfirm);
+      } catch (error) {
+        // amqplib throws when the channel is already closed.
+        clearTimeout(timer);
+        reject(
+          new EdgePublishError(`could not publish ${subject}: ${error instanceof Error ? error.message : String(error)}`, {
+            reason: 'channel-closed',
+            messageType,
+            messageId,
+            cause: error,
+          }),
+        );
+      }
+    });
+
+    const waits = [confirmed];
 
     if (!accepted) {
-      await this.waitForDrain(channel, this.config.backpressureTimeoutMs);
+      waits.push(this.waitForDrain(channel, this.config.backpressureTimeoutMs));
     }
 
-    this.publisherActive = true;
+    // allSettled, so a second failure does not surface later as an unhandled rejection.
+    const outcomes = await Promise.allSettled(waits);
+    const failed = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
+
+    if (failed) {
+      throw failed.reason;
+    }
   }
 
   private async checkPublisherTopology(): Promise<void> {
@@ -171,7 +266,7 @@ export class EdgeEventPublisher implements EdgeEventPublisher {
     });
   }
 
-  private async waitForDrain(channel: Channel, timeoutMs: number): Promise<void> {
+  private async waitForDrain(channel: ConfirmChannel, timeoutMs: number): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
         channel.off('drain', onDrain);
