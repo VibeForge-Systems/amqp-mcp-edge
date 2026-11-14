@@ -1,6 +1,6 @@
 import type { Options } from 'amqplib';
 
-import type { EdgeMessageType } from '../contracts/index.js';
+import type { EdgeEnvelope, EdgeMessageType } from '../contracts/index.js';
 import type { TargetSelector } from '../contracts/jobs.js';
 
 export interface ExchangeConfig {
@@ -102,7 +102,12 @@ export const defaultExchangeConfig: ExchangeConfig = {
   deadLetterExchange: 'mcp.edge.dlx',
 };
 
-function sanitizeRoutingSegment(value: string | undefined): string {
+/**
+ * The form a site, node, group or capability segment takes in routing keys and queue names:
+ * lowercased, with every character outside `a-z 0-9 - _` replaced by `-`, and `any` for an absent
+ * or empty value.
+ */
+export function sanitizeRoutingSegment(value: string | undefined): string {
   if (!value) {
     return 'any';
   }
@@ -145,6 +150,10 @@ export const defaultRoutingKeyStrategy: RoutingKeyStrategy = {
         return `edge.event.result.${siteId}.${nodeSegment}`;
       case 'execution.failure':
         return `edge.event.failure.${siteId}.${nodeSegment}`;
+      case 'node.hello':
+        return `edge.event.hello.${siteId}.${nodeSegment}`;
+      case 'node.heartbeat':
+        return `edge.event.heartbeat.${siteId}.${nodeSegment}`;
       default:
         return `edge.unknown.${siteId}.${nodeSegment}`;
     }
@@ -153,6 +162,106 @@ export const defaultRoutingKeyStrategy: RoutingKeyStrategy = {
 
 export function buildRoutingKey(messageType: EdgeMessageType, selector: RoutingKeySelector): string {
   return defaultRoutingKeyStrategy.build(messageType, selector);
+}
+
+/** A node's key, `<siteId>.<nodeId>` in sanitized form: the last two segments of its event routing keys. */
+export function buildNodeKey(node: { siteId: string; nodeId: string }): string {
+  return `${sanitizeRoutingSegment(node.siteId)}.${sanitizeRoutingSegment(node.nodeId)}`;
+}
+
+/** The event types in `edge.event.<type>.<siteId>.<nodeId>`, and the message type each carries. */
+export const eventRoutingTypes = {
+  ack: 'execution.ack',
+  progress: 'execution.progress',
+  result: 'execution.result',
+  failure: 'execution.failure',
+  hello: 'node.hello',
+  heartbeat: 'node.heartbeat',
+} as const satisfies Record<string, EdgeMessageType>;
+
+export type EventRoutingType = keyof typeof eventRoutingTypes;
+
+export interface ParsedEventRoutingKey {
+  eventType: EventRoutingType;
+  messageType: (typeof eventRoutingTypes)[EventRoutingType];
+  siteId: string;
+  nodeId: string;
+}
+
+/**
+ * Splits an event routing key, `edge.event.<type>.<siteId>.<nodeId>`, into its parts. Returns
+ * `undefined` for anything else, including an event type this version does not know.
+ */
+export function parseEventRoutingKey(routingKey: string): ParsedEventRoutingKey | undefined {
+  const segments = routingKey.split('.');
+
+  if (segments.length !== 5 || segments[0] !== 'edge' || segments[1] !== 'event') {
+    return undefined;
+  }
+
+  const [, , eventType, siteId, nodeId] = segments as [string, string, string, string, string];
+
+  if (!Object.hasOwn(eventRoutingTypes, eventType) || !siteId || !nodeId) {
+    return undefined;
+  }
+
+  return {
+    eventType: eventType as EventRoutingType,
+    messageType: eventRoutingTypes[eventType as EventRoutingType],
+    siteId,
+    nodeId,
+  };
+}
+
+/** What the control plane provisioned for one node: its broker username and its site and node. */
+export interface ProvisionedNode {
+  userId: string;
+  siteId: string;
+  nodeId: string;
+}
+
+/**
+ * Checks an event against the node the control plane provisioned for its sender, as "Node
+ * Identity" in docs/PROTOCOL.md requires of every consumer of the events exchange. Returns the
+ * reasons to reject it; an empty array means the event is the provisioned node's.
+ *
+ * `userId` is the AMQP `user_id` property of the delivery, which the broker has checked against
+ * the connection's user when it is present. `provisioned` is the record the control plane looked
+ * up by that `user_id`, or by whatever else it trusts.
+ */
+export function checkEventIdentity(
+  event: { routingKey: string; userId: string | undefined; envelope: EdgeEnvelope },
+  provisioned: ProvisionedNode,
+): string[] {
+  const reasons: string[] = [];
+  const { envelope } = event;
+
+  if (event.userId === undefined || event.userId === '') {
+    reasons.push('the event has no user_id; the broker checks user_id only when it is present');
+  } else if (event.userId !== provisioned.userId) {
+    reasons.push(`user_id '${event.userId}' is not the provisioned user '${provisioned.userId}'`);
+  }
+
+  if (envelope.messageType === 'execution.job') {
+    reasons.push('execution.job is not an event');
+    return reasons;
+  }
+
+  const expectedRoutingKey = buildRoutingKey(envelope.messageType, provisioned);
+
+  if (event.routingKey !== expectedRoutingKey) {
+    reasons.push(`routing key '${event.routingKey}' is not '${expectedRoutingKey}'`);
+  }
+
+  if (sanitizeRoutingSegment(envelope.payload.nodeId) !== sanitizeRoutingSegment(provisioned.nodeId)) {
+    reasons.push(`payload.nodeId '${envelope.payload.nodeId}' is not the provisioned node '${provisioned.nodeId}'`);
+  }
+
+  if (envelope.payload.siteId !== undefined && sanitizeRoutingSegment(envelope.payload.siteId) !== sanitizeRoutingSegment(provisioned.siteId)) {
+    reasons.push(`payload.siteId '${envelope.payload.siteId}' is not the provisioned site '${provisioned.siteId}'`);
+  }
+
+  return reasons;
 }
 
 export function buildJobRoutingKey(target: TargetSelector, capability: { kind: string; name: string }): string {

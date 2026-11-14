@@ -1,6 +1,9 @@
 export type {
   EdgeChannelConfig,
+  EventRoutingType,
   ExchangeConfig,
+  ParsedEventRoutingKey,
+  ProvisionedNode,
   QueueNamingStrategy,
   RoutingKeySelector,
   RoutingKeyStrategy,
@@ -10,16 +13,23 @@ export {
   buildConsumerQueueName,
   buildJobBindingKeys,
   buildJobRoutingKey,
+  buildNodeKey,
   buildRoutingKey,
+  checkEventIdentity,
   defaultAmqpUsername,
   defaultExchangeConfig,
   defaultQueueNamingStrategy,
   defaultRoutingKeyStrategy,
+  eventRoutingTypes,
+  parseEventRoutingKey,
   resolveConfig,
   resolveUserId,
+  sanitizeRoutingSegment,
   topologyModes,
   validateConfig,
 } from './config/index.js';
+
+export { edgeLibraryName, edgeLibraryVersion } from './version.js';
 
 export type { TopologyEntity, TopologyEntityKind } from './topology/index.js';
 export { EdgeTopologyError } from './topology/index.js';
@@ -30,10 +40,12 @@ export type {
   CompatibilityValidationOptions,
   CompatibilityValidationResult,
   EdgeEnvelope,
+  EdgeFailureCode,
   EdgeMessageType,
   ExecutionAttemptMetadata,
   ExecutionJobEnvelope,
   ExecutionJobPayload,
+  InstalledPackage,
   JobAckMessage,
   JobAckPayload,
   JobFailureEvent,
@@ -43,9 +55,45 @@ export type {
   JobResultEvent,
   JobResultPayload,
   MessageEnvelopeVersion,
+  NodeCapabilitySnapshot,
+  NodeHeartbeatEvent,
+  NodeHeartbeatPayload,
+  NodeHelloEvent,
+  NodeHelloPayload,
+  PackageInstallInput,
+  PackageInstallJob,
+  PackageInstallResultOutput,
+  PackageReleaseIdentity,
   TargetSelector,
+  ToolJob,
+  ToolResultOutput,
 } from './contracts/index.js';
-export { assertCompatibleEnvelope, edgeMessageTypes, isEdgeMessageType, validateCompatibility, validateEnvelope } from './contracts/index.js';
+export {
+  assertCompatibleEnvelope,
+  canonicalJson,
+  capabilitiesDigestPattern,
+  computeCapabilitiesDigest,
+  createCapabilitySnapshot,
+  distHashPattern,
+  EdgeConventionError,
+  edgeFailureCodes,
+  edgeMessageTypes,
+  EdgeUnsupportedMessageTypeError,
+  isEdgeMessageType,
+  isPackageInstallJob,
+  isToolJob,
+  nodeCapabilitySnapshotSchema,
+  packageInstallCapability,
+  packageInstallInputSchema,
+  packageInstallResultOutputSchema,
+  parsePackageInstallJob,
+  parseToolJob,
+  parseToolResultOutput,
+  toolNamePattern,
+  toolResultOutputSchema,
+  validateCompatibility,
+  validateEnvelope,
+} from './contracts/index.js';
 
 export type { EdgeJobHandler, JobDeliveryContext } from './consumer/index.js';
 export { EdgeJobConsumer } from './consumer/index.js';

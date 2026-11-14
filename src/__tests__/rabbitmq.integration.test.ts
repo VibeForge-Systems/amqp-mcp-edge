@@ -10,17 +10,25 @@ import {
   buildJobBindingKeys,
   buildJobRoutingKey,
   buildRoutingKey,
+  checkEventIdentity,
+  computeCapabilitiesDigest,
+  createCapabilitySnapshot,
   createEdgeChannel,
   defaultExchangeConfig,
   EdgeChannelConnectionManager,
   EdgeJobConsumer,
   EdgeTopologyError,
+  packageInstallResultOutputSchema,
+  parseEventRoutingKey,
+  parsePackageInstallJob,
   validateEnvelope,
 } from '../index.js';
 import {
   createAckMessage,
+  createBaseEnvelope,
   createExecutionJob,
   createFailureMessage,
+  createPackageInstallJob,
   createProgressMessage,
   createResultMessage,
 } from './fixtures.js';
@@ -975,7 +983,9 @@ test('least privilege: a passive-mode worker with configure \'^$\' runs jobs and
   for (const message of events) {
     // Every event carries the node's broker username, which the broker has validated.
     assert.equal(message.properties.userId, harness.nodeUser);
-    assert.equal(validateEnvelope(JSON.parse(message.content.toString('utf8'))).payload.jobId, jobEnvelope.payload.jobId);
+    const envelope = validateEnvelope(JSON.parse(message.content.toString('utf8')));
+    assert.ok(envelope.messageType.startsWith('execution.') && 'jobId' in envelope.payload);
+    assert.equal(envelope.payload.jobId, jobEnvelope.payload.jobId);
   }
 
   // Dead-lettering needs no permission from the node: a job it rejects reaches the dead-letter
@@ -1161,4 +1171,95 @@ test('least privilege: after a reconnect a passive consumer whose queue is gone 
   const [event] = await received;
   assert.equal(event?.properties.messageId, `failure-${harness.runId}`);
   assert.equal(event?.properties.userId, harness.nodeUser);
+});
+
+test('least privilege: node.hello, node.heartbeat and a package.install job round trip under the node permission set', { timeout: 60000 }, async (t) => {
+  const api = await managementApiOrSkip(t);
+  if (!api) {
+    return;
+  }
+
+  const harness = await createLeastPrivilegeHarness(t, api);
+  const { jobsExchange } = defaultExchangeConfig;
+  const edgeChannel = await createEdgeChannel({
+    amqpUrl: harness.nodeAmqpUrl,
+    siteId: harness.siteId,
+    nodeId: harness.nodeId,
+    topologyMode: 'passive',
+    runtimeConsumerVersion: '0.1.0',
+    runtimeProducerVersion: '0.1.0',
+    connectionName: `amqp-mcp-edge-lifecycle-${harness.runId}`,
+  });
+  harness.cleanup.defer(() => edgeChannel.close());
+
+  const node = { siteId: harness.siteId, nodeId: harness.nodeId };
+  const lifecycle = { ...node, sessionId: `session-${harness.runId}`, heartbeatIntervalMs: 30000 };
+  const distHash = `mcpod-dist-v2:${'a'.repeat(64)}`;
+  const release = { packageId: 'net-tools', packageVersion: '1.2.0', releaseId: `rel-${harness.runId}` };
+  let snapshot = createCapabilitySnapshot();
+
+  // The node: hello, then a deploy job, then a heartbeat carrying the changed snapshot.
+  edgeChannel.consumer.onJob(async (job, delivery) => {
+    const install = parsePackageInstallJob(job);
+    const common = { jobId: job.payload.jobId, attemptId: job.payload.attemptId, ...node };
+    await edgeChannel.publisher.publishAck(createAckMessage({ messageId: `ack-${harness.runId}`, payload: { ...common, accepted: true } }));
+    snapshot = createCapabilitySnapshot({ packages: [{ ...install.release, distHash: install.distHash }] });
+    await edgeChannel.publisher.publishResult(
+      createResultMessage({
+        messageId: `result-${harness.runId}`,
+        payload: { ...common, completedAt: new Date().toISOString(), output: { release: install.release, distHash: install.distHash, alreadyInstalled: false } },
+      }),
+    );
+    await edgeChannel.consumer.ack(delivery);
+    await edgeChannel.publisher.publishNodeHeartbeat({
+      ...createBaseEnvelope(),
+      messageType: 'node.heartbeat',
+      messageId: `heartbeat-${harness.runId}`,
+      payload: { ...lifecycle, sequence: 2, capabilities: snapshot, capabilitiesDigest: computeCapabilitiesDigest(snapshot) },
+    });
+  });
+  await edgeChannel.consumer.start();
+
+  const received = collectDeliveries(harness.controlChannel, harness.controlQueueName, 4, 15000);
+  await edgeChannel.publisher.publishNodeHello({
+    ...createBaseEnvelope(),
+    messageType: 'node.hello',
+    messageId: `hello-${harness.runId}`,
+    payload: { ...lifecycle, sequence: 1, startedAt: new Date().toISOString(), capabilities: snapshot, capabilitiesDigest: computeCapabilitiesDigest(snapshot) },
+  });
+
+  // The control plane: a deploy job for this node.
+  const base = createPackageInstallJob();
+  const job = createPackageInstallJob(
+    { release },
+    {
+      messageId: `install-${harness.runId}`,
+      payload: { ...base.payload, jobId: `install-${harness.runId}`, attemptId: `install-${harness.runId}-1`, target: node, input: { ...base.payload.input, release, distHash } },
+    },
+  );
+  harness.controlChannel.publish(jobsExchange, buildJobRoutingKey(job.payload.target, job.payload.capability), Buffer.from(JSON.stringify(job), 'utf8'), {
+    contentType: 'application/json',
+    type: job.messageType,
+    messageId: job.messageId,
+    userId: harness.adminUser,
+  });
+
+  const events = await received;
+  const provisioned = { userId: harness.nodeUser, ...node };
+  const parsed = events.map((message) => {
+    const envelope = validateEnvelope(JSON.parse(message.content.toString('utf8')));
+    // What every consumer of the events exchange checks: the broker-validated user_id and routing key.
+    assert.deepEqual(checkEventIdentity({ routingKey: message.fields.routingKey, userId: message.properties.userId, envelope }, provisioned), []);
+    assert.equal(parseEventRoutingKey(message.fields.routingKey)?.messageType, envelope.messageType);
+    return envelope;
+  });
+
+  assert.deepEqual(parsed.map((envelope) => envelope.messageType), ['node.hello', 'execution.ack', 'execution.result', 'node.heartbeat']);
+  const [hello, , result, heartbeat] = parsed;
+  assert.ok(hello?.messageType === 'node.hello' && result?.messageType === 'execution.result' && heartbeat?.messageType === 'node.heartbeat');
+  assert.deepEqual(hello.payload.capabilities.packages, []);
+  assert.equal(packageInstallResultOutputSchema.parse(result.payload.output).release.releaseId, release.releaseId);
+  assert.deepEqual(heartbeat.payload.capabilities?.packages, [{ ...release, distHash }]);
+  assert.notEqual(heartbeat.payload.capabilitiesDigest, hello.payload.capabilitiesDigest);
+  assert.equal(heartbeat.payload.sessionId, hello.payload.sessionId);
 });

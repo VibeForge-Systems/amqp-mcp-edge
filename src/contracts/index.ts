@@ -14,6 +14,8 @@ import {
 } from './events.js';
 import type { ExecutionJobEnvelope, ExecutionJobPayload, TargetSelector } from './jobs.js';
 import { executionJobEnvelopeSchema } from './jobs.js';
+import type { NodeHeartbeatEvent, NodeHelloEvent } from './node.js';
+import { nodeHeartbeatEnvelopeSchema, nodeHelloEnvelopeSchema } from './node.js';
 import { validateCompatibility } from './compatibility.js';
 
 export type {
@@ -36,13 +38,54 @@ export type {
   JobResultEvent,
   JobFailureEvent,
 } from './events.js';
+export type {
+  InstalledPackage,
+  NodeCapabilitySnapshot,
+  NodeHeartbeatEvent,
+  NodeHeartbeatPayload,
+  NodeHelloEvent,
+  NodeHelloPayload,
+} from './node.js';
+export {
+  capabilitiesDigestPattern,
+  computeCapabilitiesDigest,
+  createCapabilitySnapshot,
+  nodeCapabilitySnapshotSchema,
+} from './node.js';
+export type { PackageReleaseIdentity } from './primitives.js';
+export { distHashPattern } from './primitives.js';
+export type {
+  EdgeFailureCode,
+  PackageInstallInput,
+  PackageInstallJob,
+  PackageInstallResultOutput,
+  ToolJob,
+  ToolResultOutput,
+} from './conventions.js';
+export {
+  edgeFailureCodes,
+  EdgeConventionError,
+  isPackageInstallJob,
+  isToolJob,
+  packageInstallCapability,
+  packageInstallInputSchema,
+  packageInstallResultOutputSchema,
+  parsePackageInstallJob,
+  parseToolJob,
+  parseToolResultOutput,
+  toolNamePattern,
+  toolResultOutputSchema,
+} from './conventions.js';
+export { canonicalJson } from './canonical-json.js';
 
 export type EdgeEnvelope =
   | ExecutionJobEnvelope
   | JobAckMessage
   | JobProgressEvent
   | JobResultEvent
-  | JobFailureEvent;
+  | JobFailureEvent
+  | NodeHelloEvent
+  | NodeHeartbeatEvent;
 
 const envelopeSchemaMap = {
   'execution.job': executionJobEnvelopeSchema,
@@ -50,12 +93,34 @@ const envelopeSchemaMap = {
   'execution.progress': jobProgressEnvelopeSchema,
   'execution.result': jobResultEnvelopeSchema,
   'execution.failure': jobFailureEnvelopeSchema,
+  'node.hello': nodeHelloEnvelopeSchema,
+  'node.heartbeat': nodeHeartbeatEnvelopeSchema,
 } as const;
+
+/**
+ * The envelope names a `messageType` this version of the library does not know. Under the
+ * compatibility rules a consumer ignores such a message (acks it and drops it) rather than treating
+ * it as invalid: it may be a message type added after this version.
+ */
+export class EdgeUnsupportedMessageTypeError extends Error {
+  public readonly messageType: unknown;
+
+  public constructor(messageType: unknown) {
+    super(`unsupported messageType: ${String(messageType)}`);
+    this.name = 'EdgeUnsupportedMessageTypeError';
+    this.messageType = messageType;
+  }
+}
 
 export function isEdgeMessageType(value: unknown): value is EdgeMessageType {
   return typeof value === 'string' && edgeMessageTypes.includes(value as EdgeMessageType);
 }
 
+/**
+ * Validates an envelope against the schema of its `messageType`. Throws an
+ * `EdgeUnsupportedMessageTypeError` for a `messageType` this version does not know, and an `Error`
+ * whose message starts `invalid <messageType> envelope:` for one that fails its schema.
+ */
 export function validateEnvelope(payload: unknown): EdgeEnvelope {
   if (typeof payload !== 'object' || payload === null || !('messageType' in payload)) {
     throw new Error('payload is not a valid edge envelope');
@@ -64,7 +129,7 @@ export function validateEnvelope(payload: unknown): EdgeEnvelope {
   const messageType = (payload as { messageType?: unknown }).messageType;
 
   if (!isEdgeMessageType(messageType)) {
-    throw new Error(`unsupported messageType: ${String(messageType)}`);
+    throw new EdgeUnsupportedMessageTypeError(messageType);
   }
 
   try {

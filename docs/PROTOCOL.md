@@ -42,11 +42,19 @@ export interface CompatibilityMetadata {
 ```
 
 Supported message types:
-- `execution.job`
-- `execution.ack`
-- `execution.progress`
-- `execution.result`
-- `execution.failure`
+
+| Message type | Direction | Exchange | Defined in |
+|:---|:---|:---|:---|
+| `execution.job` | control plane → node | `mcp.edge.jobs` | [Job Contract](#job-contract) |
+| `execution.ack` | node → control plane | `mcp.edge.events` | [Event Contracts](#event-contracts) |
+| `execution.progress` | node → control plane | `mcp.edge.events` | [Event Contracts](#event-contracts) |
+| `execution.result` | node → control plane | `mcp.edge.events` | [Event Contracts](#event-contracts) |
+| `execution.failure` | node → control plane | `mcp.edge.events` | [Event Contracts](#event-contracts) |
+| `node.hello` | node → control plane | `mcp.edge.events` | [Node Lifecycle Messages](#node-lifecycle-messages) |
+| `node.heartbeat` | node → control plane | `mcp.edge.events` | [Node Lifecycle Messages](#node-lifecycle-messages) |
+
+All of them carry `specVersion: '1.0'`. How a consumer treats a message type it does not know is
+in [Versioning And Compatibility](#versioning-and-compatibility).
 
 ## Job Contract
 
@@ -164,6 +172,251 @@ export interface JobFailurePayload {
 export type JobFailureEvent = BaseEdgeEnvelope<'execution.failure', JobFailurePayload>;
 ```
 
+## Node Lifecycle Messages
+
+A node announces itself with `node.hello` and stays visible with `node.heartbeat`. Both go to
+`mcp.edge.events`, like the execution events, and carry the AMQP `user_id` that identifies the node
+(see [Node Identity](#node-identity)). The library validates and publishes them
+(`publisher.publishNodeHello`, `publisher.publishNodeHeartbeat`); when to send them is the worker's
+job, following the rules below.
+
+Capability snapshot, what a node can run:
+
+```ts
+export interface NodeCapabilitySnapshot {
+  edgeLibrary: {
+    name: string;       // '@vibeforge-systems/amqp-mcp-edge'
+    version: string;    // this library's version, such as '0.1.0'
+  };
+  runtimes: Record<string, string>; // name to version, such as { node: '22.20.0' }; at least one
+  packages: InstalledPackage[];     // may be empty
+}
+
+export interface InstalledPackage {
+  packageId: string;
+  packageVersion: string;
+  releaseId?: string;   // the release the control plane installed it from, if it did
+  distHash: string;     // the dist hash the node computed over what it installed; see "Deploy jobs"
+}
+```
+
+Hello, published once after every connection to the broker, the first one included:
+
+```ts
+export interface NodeHelloPayload {
+  siteId: string;
+  nodeId: string;
+  sessionId: string;            // one run of the node process: kept across reconnects, not restarts
+  sequence: number;             // positive safe integer; see the rules below
+  startedAt: string;            // when this session started (RFC 3339)
+  heartbeatIntervalMs: number;  // positive safe integer
+  capabilities: NodeCapabilitySnapshot;
+  capabilitiesDigest: string;   // the digest of capabilities
+}
+
+export type NodeHelloEvent = BaseEdgeEnvelope<'node.hello', NodeHelloPayload>;
+```
+
+Heartbeat, published every `heartbeatIntervalMs` while the node is connected:
+
+```ts
+export interface NodeHeartbeatPayload {
+  siteId: string;
+  nodeId: string;
+  sessionId: string;
+  sequence: number;
+  heartbeatIntervalMs: number;
+  capabilitiesDigest: string;               // the digest of the node's current snapshot
+  capabilities?: NodeCapabilitySnapshot;    // the snapshot itself; see the rules below
+}
+
+export type NodeHeartbeatEvent = BaseEdgeEnvelope<'node.heartbeat', NodeHeartbeatPayload>;
+```
+
+Unlike the execution events, both require `siteId`: a node is identified by its site and node
+together.
+
+### Capability digest
+
+`capabilitiesDigest` is `sha256:` followed by the 64 lowercase hex digits of the SHA-256 of the
+snapshot's canonical JSON, as [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) (JCS) defines
+it: no whitespace, object members sorted by the UTF-16 code units of their names, and strings and
+numbers written as ECMAScript's `JSON.stringify` writes them. The digest covers every member the
+snapshot carries, unknown ones included. Arrays keep their order, so `packages` listed in another
+order give another digest; `createCapabilitySnapshot` sorts them by `packageId`, then
+`packageVersion`, and a node should list them in that order.
+
+`computeCapabilitiesDigest` computes it, and the validators reject a `node.hello` or
+`node.heartbeat` that carries `capabilities` with a digest that does not match them. A control
+plane may compare digests without computing them.
+
+Test vector. This snapshot
+
+```json
+{
+  "runtimes": { "node": "22.20.0" },
+  "packages": [
+    {
+      "releaseId": "rel-1",
+      "packageVersion": "1.2.0",
+      "packageId": "net-tools",
+      "distHash": "mcpod-dist-v2:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "edgeLibrary": { "version": "0.1.0", "name": "@vibeforge-systems/amqp-mcp-edge" }
+}
+```
+
+has the canonical form
+
+```text
+{"edgeLibrary":{"name":"@vibeforge-systems/amqp-mcp-edge","version":"0.1.0"},"packages":[{"distHash":"mcpod-dist-v2:0000000000000000000000000000000000000000000000000000000000000000","packageId":"net-tools","packageVersion":"1.2.0","releaseId":"rel-1"}],"runtimes":{"node":"22.20.0"}}
+```
+
+and the digest
+`sha256:c50b81fdd0a559330746ba1d3a830ad7f6a2b20b934ec7c90c40951d746530d2`.
+
+### Sending rules
+
+A node:
+
+- **Sends `node.hello` after every connection**, before any other event on that connection.
+  A reconnect keeps the `sessionId`; a process restart starts a new one, with a new `startedAt`.
+- **Numbers its lifecycle messages.** `sequence` is 1 on the first `node.hello` of a session and
+  increases by at least 1 with every `node.hello` and `node.heartbeat` after it, across reconnects.
+- **Sends `node.heartbeat` every `heartbeatIntervalMs`** while connected, with the digest of its
+  current snapshot.
+- **Sends the snapshot when it changes.** A heartbeat must carry `capabilities` when the snapshot
+  differs from the one in the node's previous lifecycle message of the session, for example after
+  a `package.install` job. It may carry it at any time, and should carry it at least every tenth
+  heartbeat, so a control plane that lost its record catches up.
+
+A control plane:
+
+- **Keeps, per node, the latest `sessionId`, `sequence`, snapshot and digest.** It ignores a
+  lifecycle message whose `sequence` is not greater than the last one it accepted for that session.
+  A new `sessionId` means the node restarted: its in-flight jobs will not complete.
+- **Treats a node as offline** when no lifecycle message of its current session has arrived for
+  three times its `heartbeatIntervalMs`.
+- **Treats the node's capabilities as unknown** when a heartbeat's digest differs from the stored
+  one and the heartbeat carries no snapshot, until a message that carries one arrives.
+
+## Job Conventions
+
+The job contract leaves `capability` and `input` open. These conventions give them a meaning for
+the two kinds of work a control plane sends today: running an MCP tool, and installing a package.
+A job is in a convention when its `capability` selects it; `parseToolJob` and
+`parsePackageInstallJob` check one, and throw an `EdgeConventionError` listing what is wrong.
+`validateEnvelope` does not apply them, so a malformed job reaches the handler, which can answer
+it with an `execution.failure` instead of leaving it to the dead-letter queue.
+
+### Tool jobs
+
+`capability: { kind: 'tool', name }` runs one MCP tool.
+
+| Field | Meaning |
+|:---|:---|
+| `capability.name` | The MCP tool name, exactly as the node's MCP server lists it: 1 to 128 characters, each an ASCII letter, digit, `_`, `-` or `.`, as the MCP tool-name rule says. The routing key carries a sanitized form (`search.documents` becomes `search-documents`), so a node always takes the name from the payload. |
+| `capability.version` | Optional. When set, a node that cannot run that version fails the job with `UNSUPPORTED_CAPABILITY`. |
+| `input` | The tool's `arguments` object, passed to the tool unchanged. The tool validates it against its input schema; invalid arguments are `INVALID_INPUT`. |
+| `timeoutMs` | The longest the tool may run, measured from when the node starts it. Past that, the node stops it and publishes `execution.failure` with code `TIMEOUT`. |
+| `idempotencyKey` | The same on every attempt of one logical call; each attempt has a new `attemptId`. A node may remember completed keys and answer a repeat with the earlier outcome instead of running the tool again. |
+| `packageAssignment` | Optional. When set, the node runs the tool from that package release, or fails the job with `UNSUPPORTED_CAPABILITY`. |
+
+The `execution.result` output is the tool's MCP `CallToolResult`: a `content` array of content
+blocks, and optionally `structuredContent` (any JSON value) and `isError`. A tool that ran and
+reported an error is an `execution.result` with `isError: true`, not an `execution.failure`.
+`execution.failure` means the tool did not produce a result: unknown tool, invalid input, timeout,
+or a crash. A job cannot answer the questions of an `input_required` result, so a node that gets
+one fails the job with `INPUT_REQUIRED`; `resultType`, if present, is `complete`.
+`parseToolResultOutput` validates the output.
+
+`retryable` on a tool failure is the node's judgment of whether running the same call again is
+safe. A node should set it to `true` only for tools annotated `readOnlyHint` or `idempotentHint`,
+and for failures that happened before the tool started.
+
+### Deploy jobs (`package.install`)
+
+`capability: { kind: 'task', name: 'package.install' }` installs one package release on the node.
+
+```ts
+export interface PackageInstallInput {
+  release: {
+    packageId: string;
+    packageVersion: string;
+    releaseId: string;
+  };
+  download: {
+    url: string;          // a signed https URL for the release archive
+    expiresAt?: string;   // RFC 3339, when the URL stops working, if known
+  };
+  distHash: string;       // the dist hash the node must compute before installing anything
+}
+```
+
+- **The release** is identified by all three fields. `packageAssignment`, if the job sets it, must
+  name the same release.
+- **The URL** is `https`, absolute, and carries no username or password. It is signed, so it is a
+  credential for as long as it is valid: a node never logs it and never copies it into an event.
+  An expired or refused URL is `PACKAGE_URL_EXPIRED`, which the control plane answers with a new
+  job carrying a fresh URL.
+- **The dist hash** is an algorithm tag, a colon, and 64 or 128 lowercase hex digits, with nothing
+  before or after it, such as `mcpod-dist-v2:<64 hex>`. The package format defines the tag and how
+  the value is computed over the archive's contents; this protocol carries it and compares it as
+  an exact string. A node that does not implement the tag fails the job with
+  `PACKAGE_HASH_UNSUPPORTED`. A node computes the hash over what it downloaded before it loads,
+  runs or installs anything from it; on a mismatch it installs nothing and fails the job with
+  `PACKAGE_HASH_MISMATCH`.
+- **Targeting.** A deploy job names one node (`target.siteId` and `target.nodeId`) and routes as
+  `edge.job.<siteId>.<nodeId>.task.package-install`.
+- **`timeoutMs`** covers the download, the verification and the installation.
+- **Idempotency.** Installing a release the node already has, with the same dist hash, succeeds
+  without installing anything, and reports `alreadyInstalled: true`. A suitable `idempotencyKey`
+  is `install:<releaseId>:<siteId>.<nodeId>`.
+
+The `execution.result` output (`packageInstallResultOutputSchema`):
+
+```ts
+export interface PackageInstallResultOutput {
+  release: { packageId: string; packageVersion: string; releaseId: string };
+  distHash: string;           // the dist hash the node computed
+  alreadyInstalled: boolean;
+}
+```
+
+After a successful install, the node's next lifecycle message carries the new snapshot, with the
+release in `packages`.
+
+### Failure codes
+
+`execution.failure` `code` values with a standard meaning, exported as `edgeFailureCodes`. A node
+may use other codes as well.
+
+| Code | Meaning | `retryable` |
+|:---|:---|:---|
+| `INVALID_INPUT` | The input breaks the capability's input contract, or the job breaks its convention | `false` |
+| `UNSUPPORTED_CAPABILITY` | The node does not provide the capability, or not the version or release asked for | `false` |
+| `TIMEOUT` | The job ran past `timeoutMs` and was stopped | see [Tool jobs](#tool-jobs) |
+| `INPUT_REQUIRED` | The tool answered `input_required` | `false` |
+| `HANDLER_ERROR` | Anything else that stopped the handler | the node's judgment |
+| `PACKAGE_DOWNLOAD_FAILED` | The archive could not be downloaded | `true` |
+| `PACKAGE_URL_EXPIRED` | The signed URL had expired, or the store refused it | `true`, with a new URL |
+| `PACKAGE_HASH_UNSUPPORTED` | The node does not implement the dist hash's algorithm tag | `false` |
+| `PACKAGE_HASH_MISMATCH` | The computed dist hash differs from the expected one; nothing was installed | `false` |
+| `PACKAGE_INSTALL_FAILED` | Downloaded and verified, but the installation failed | `false` |
+
+`retryable: true` tells the control plane that a new attempt (same `idempotencyKey`, new
+`attemptId`) may succeed. `details` must not contain the download URL or any other credential.
+
+### Reserved capability names
+
+Task names that start with `package.` or `node.` are reserved for conventions defined here. A node
+that receives a reserved task name it does not implement fails the job with
+`UNSUPPORTED_CAPABILITY`. Node control actions (validating installed packages, retiring a node,
+changing its configuration) will be defined as `node.*` tasks, so they reuse the job's
+acknowledgement, timeout, idempotency and dead-lettering instead of needing a message type and
+routing of their own.
+
 ## Timestamp Format
 
 These fields hold timestamps:
@@ -174,6 +427,8 @@ These fields hold timestamps:
 | `payload.attempt.firstAttemptAt`, `payload.attempt.previousAttemptAt` | `execution.job`, optional |
 | `payload.completedAt` | `execution.result` |
 | `payload.failedAt` | `execution.failure` |
+| `payload.startedAt` | `node.hello` |
+| `payload.input.download.expiresAt` | a `package.install` job, optional; checked by `parsePackageInstallJob` |
 
 Each is an RFC 3339 date-time, and the validators accept only this form:
 
@@ -204,6 +459,11 @@ Recommended routing key patterns:
 - progress: `edge.event.progress.<siteId>.<nodeId>`
 - result: `edge.event.result.<siteId>.<nodeId>`
 - failure: `edge.event.failure.<siteId>.<nodeId>`
+- hello: `edge.event.hello.<siteId>.<nodeId>`
+- heartbeat: `edge.event.heartbeat.<siteId>.<nodeId>`
+
+Every event routing key has five segments, `edge.event.<type>.<siteId>.<nodeId>`;
+`parseEventRoutingKey` splits one, and `buildNodeKey` gives the `<siteId>.<nodeId>` pair.
 
 Rules:
 - job and event routing must remain separate from [amqp-mcp-transport](https://github.com/VibeForge-Systems/amqp-mcp-transport) routing.
@@ -318,10 +578,10 @@ The AMQP `user_id` message property is the node's identity on the wire. Payload 
 `nodeId` and `siteId`, and the routing key, are claims the node makes; `user_id` is checked by the
 broker.
 
-- **The library sets it on every event.** Every ack, progress, result and failure event carries
-  `user_id` equal to the broker username the node authenticated with: the `userId` config field
-  if set, otherwise the URL-decoded username in `amqpUrl`, otherwise `guest` (what amqplib logs in
-  with when the URL has no credentials).
+- **The library sets it on every event.** Every ack, progress, result, failure, hello and
+  heartbeat event carries `user_id` equal to the broker username the node authenticated with: the
+  `userId` config field if set, otherwise the URL-decoded username in `amqpUrl`, otherwise `guest`
+  (what amqplib logs in with when the URL has no credentials).
 - **The broker validates it.** RabbitMQ compares `user_id`, when it is present, with the
   connection's user. On a mismatch it does not route the message and closes the channel with
   `406 PRECONDITION_FAILED` ("user_id property set to '…' but authenticated user was '…'").
@@ -331,6 +591,16 @@ broker.
   to the site and node it provisioned for that user, and reject events whose routing key or
   `payload.siteId` / `payload.nodeId` belong to another node.
 - **Never give a node user the `impersonator` tag.** A user with that tag may set any `user_id`.
+
+A node is known on the wire by its key, `<siteId>.<nodeId>` in sanitized form, which is also the
+last two segments of its event routing keys and of its queue name. The control plane records, when
+it provisions a node, the broker username it created and the node's site and node IDs, and maps
+`user_id` to that record; it does not parse the key out of the username. On every event,
+`checkEventIdentity(event, provisioned)` applies the rules above and returns the reasons to reject
+it: no `user_id`, a `user_id` other than the provisioned user, a routing key other than the one
+`buildRoutingKey` gives for the provisioned node, or a `payload.nodeId` or `payload.siteId` that
+sanitizes to another node. Site and node IDs that are already in sanitized form avoid two IDs
+mapping to the same key.
 
 Events published by versions of this library before `user_id` was added carry none. Upgrade the
 edge nodes before a consumer starts enforcing the rule above.
@@ -343,6 +613,26 @@ Rules:
 - consumers must ignore unknown additive fields.
 - breaking semantic changes require a new `specVersion`.
 - publishers may require minimum consumer versions with `compatibility.minConsumerVersion`.
+- a new message type, a new routing-key event type and a new job convention are additive: they
+  keep `specVersion: '1.0'`.
+
+How a 1.0 consumer treats a message type it does not know:
+
+- **It ignores the message.** It acks it and drops it, and may log it; it does not reject it,
+  dead-letter it or treat it as an error. `validateEnvelope` throws an
+  `EdgeUnsupportedMessageTypeError` for a type it does not know, so a consumer can tell it from an
+  invalid message. Builds of this library without that class throw a plain `Error` with the
+  message `unsupported messageType: <type>`.
+- **`node.hello` and `node.heartbeat` are the first such types.** A control plane that predates
+  them receives them only if it binds the events exchange broadly (`edge.event.#`, or
+  `edge.event.*.<siteId>.<nodeId>`); one that binds the execution event types by name never sees
+  them. Either way it must ignore them as above.
+- **Nodes never receive them.** Lifecycle messages flow from node to control plane only. A job
+  consumer rejects, without requeue, anything on its queue that is not an `execution.job`.
+- **Conventions travel inside `execution.job`.** A node that predates a convention sees an
+  ordinary job with a capability it does not provide, and fails it with
+  `UNSUPPORTED_CAPABILITY`. `node.hello` and the conventions arrived together, so a control plane
+  should send a `package.install` job only to a node that has sent `node.hello`.
 
 Recommended release policy:
 - semver for package releases

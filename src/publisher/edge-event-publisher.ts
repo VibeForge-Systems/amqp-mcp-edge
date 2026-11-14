@@ -8,6 +8,8 @@ import {
   type JobFailureEvent,
   type JobProgressEvent,
   type JobResultEvent,
+  type NodeHeartbeatEvent,
+  type NodeHelloEvent,
 } from '../contracts/index.js';
 import type { EdgeChannelConnectionManager } from '../connection/connection-manager.js';
 import { createHealthSnapshot, type EdgeChannelHealth } from '../health/index.js';
@@ -18,10 +20,18 @@ export interface EdgeEventPublisher {
   publishProgress(message: JobProgressEvent): Promise<void>;
   publishResult(message: JobResultEvent): Promise<void>;
   publishFailure(message: JobFailureEvent): Promise<void>;
+  publishNodeHello(message: NodeHelloEvent): Promise<void>;
+  publishNodeHeartbeat(message: NodeHeartbeatEvent): Promise<void>;
   health(): Promise<EdgeChannelHealth>;
 }
 
-type PublishableEvent = JobAckMessage | JobProgressEvent | JobResultEvent | JobFailureEvent;
+type PublishableEvent =
+  | JobAckMessage
+  | JobProgressEvent
+  | JobResultEvent
+  | JobFailureEvent
+  | NodeHelloEvent
+  | NodeHeartbeatEvent;
 
 export class EdgeEventPublisher implements EdgeEventPublisher {
   private readonly config;
@@ -83,6 +93,16 @@ export class EdgeEventPublisher implements EdgeEventPublisher {
   }
 
   public async publishFailure(message: JobFailureEvent): Promise<void> {
+    await this.publish(message);
+  }
+
+  /** Publishes `node.hello`, which a node sends after each connection; see docs/PROTOCOL.md. */
+  public async publishNodeHello(message: NodeHelloEvent): Promise<void> {
+    await this.publish(message);
+  }
+
+  /** Publishes `node.heartbeat`, which a node sends every `heartbeatIntervalMs` while connected. */
+  public async publishNodeHeartbeat(message: NodeHeartbeatEvent): Promise<void> {
     await this.publish(message);
   }
 

@@ -1,11 +1,26 @@
 import type { EdgeChannelConfig } from '../config/index.js';
 import { buildRoutingKey, resolveConfig, resolveUserId } from '../config/index.js';
-import { validateEnvelope, type ExecutionJobEnvelope, type JobAckMessage, type JobFailureEvent, type JobProgressEvent, type JobResultEvent } from '../contracts/index.js';
+import {
+  validateEnvelope,
+  type ExecutionJobEnvelope,
+  type JobAckMessage,
+  type JobFailureEvent,
+  type JobProgressEvent,
+  type JobResultEvent,
+  type NodeHeartbeatEvent,
+  type NodeHelloEvent,
+} from '../contracts/index.js';
 import { createHealthSnapshot, type EdgeChannelHealth } from '../health/index.js';
 import type { EdgeChannel } from '../connection/index.js';
 import type { EdgeJobHandler, JobDeliveryContext } from '../consumer/index.js';
 
-type EdgeEventEnvelope = JobAckMessage | JobProgressEvent | JobResultEvent | JobFailureEvent;
+type EdgeEventEnvelope =
+  | JobAckMessage
+  | JobProgressEvent
+  | JobResultEvent
+  | JobFailureEvent
+  | NodeHelloEvent
+  | NodeHeartbeatEvent;
 
 export interface MockPublishedEvent {
   routingKey: string;
@@ -150,6 +165,14 @@ class MockEdgeEventPublisher {
   }
 
   public async publishFailure(message: JobFailureEvent): Promise<void> {
+    this.publish(message);
+  }
+
+  public async publishNodeHello(message: NodeHelloEvent): Promise<void> {
+    this.publish(message);
+  }
+
+  public async publishNodeHeartbeat(message: NodeHeartbeatEvent): Promise<void> {
     this.publish(message);
   }
 
