@@ -68,7 +68,7 @@ share a broker.
 | **Typed contracts** | Versioned envelopes for jobs, acks, progress, results and failures |
 | **Runtime validation** | Inbound and outbound envelopes are validated at the boundary |
 | **Compatibility checks** | Rejects jobs whose `minConsumerVersion` the worker does not meet |
-| **Consumer primitive** | Job consumer that declares and binds its queue, or in passive mode only checks it, and re-subscribes after a connection drop |
+| **Consumer primitive** | Job consumer that declares and binds its queue, or in passive mode only checks it, and subscribes again after a reconnect, a channel the broker closed, or a subscription the broker cancelled |
 | **Publisher primitive** | Event publisher on a confirm channel: each publish resolves once the broker confirms the event, and waits for channel drain under backpressure |
 | **Node identity** | Every event carries the broker-validated AMQP `user_id` of the node, and `checkEventIdentity` checks it on the control-plane side |
 | **Node lifecycle** | `node.hello` and `node.heartbeat` events with a capability snapshot (installed packages, runtimes, library version) and its digest |
@@ -170,8 +170,8 @@ await channel.consumer.start();
 | `runtimeConsumerVersion` | — | Checked against a job's `compatibility.minConsumerVersion` |
 | `runtimeProducerVersion` | — | Checked against an event's `compatibility.minProducerVersion` |
 | `connectionName` | `amqp-mcp-edge` | Connection name shown by the broker |
-| `reconnectEnabled` | `true` | Reconnect after the connection drops |
-| `reconnectDelayMs` | `1000` | First reconnect delay; doubles after each failed attempt |
+| `reconnectEnabled` | `true` | Reconnect after the connection drops, and reopen a channel the broker closes while the connection stays up. With `false`, either is reopened only when next used |
+| `reconnectDelayMs` | `1000` | First reconnect delay; doubles after each failed attempt. Also the first delay before reopening a channel that closes again within `reconnectMaxDelayMs` |
 | `reconnectMaxDelayMs` | `30000` | Upper bound of the reconnect delay |
 | `backpressureTimeoutMs` | `5000` | How long a publish waits for the channel to drain |
 | `confirmTimeoutMs` | `10000` | How long a publish waits for the broker's confirm. Every publish resolves only once the broker confirms the event, and rejects with an `EdgePublishError` if it nacks it, the channel closes first, or this time passes |
@@ -212,6 +212,33 @@ const channel = await createEdgeChannel({
 
 `'declare'` remains the default in 0.x, for backward compatibility and local development against
 a broker you own.
+
+### Reconnects, channel closes and health
+
+- **A dropped connection** is reopened with backoff. Both channels are new: the consumer
+  subscribes again, in passive mode after checking its queue.
+- **A channel the broker closes** while the connection stays up, for example with
+  `PRECONDITION_FAILED`, is reopened on the same connection, and only its component recovers.
+  The consumer subscribes again. The publisher checks the events exchange again before its next
+  publish in passive mode, so a deleted exchange fails with an `EdgeTopologyError`. A channel that
+  keeps closing is reopened after a growing delay.
+- **A subscription the broker cancels**, for example because its queue was deleted, is restored
+  the same way. In passive mode, a consumer whose queue is gone stops, with the reason in
+  `details.topologyError`; it does not retry.
+- **A job in flight belongs to its subscription.** When a channel closes, the broker returns the
+  jobs left unacked on it to the queue and delivers them again, marked redelivered. The handler
+  still holding such a job gets an `EdgeStaleDeliveryError` from `ack` or `nack`, and nothing is
+  sent: on a new channel, the same delivery tag may name another job. Pass the handler's
+  `delivery` unchanged, because its `subscriptionId` tells the two apart. A job that published its
+  result before the close runs again, so the control plane deduplicates outcomes by `jobId` and
+  `attemptId`.
+- **`consumerActive` and `publisherActive`** have the same values in both components' `health()`.
+  The consumer is active while it is subscribed on the open consumer channel. The publisher is
+  active while its latest publish was confirmed and that channel is still open, which is false
+  before the first publish. Both snapshots also carry the connection's `details`: the reconnect
+  state, `consumerChannelReopens`, `publisherChannelReopens` and the last broker error on a
+  channel (`lastChannelError`). The consumer adds `discardedDeliveries`, the deliveries dropped
+  because their subscription ended, and `brokerCancellations`.
 
 ---
 
@@ -354,10 +381,6 @@ runtime still has gaps that matter for production use. They will be closed befor
 - **RabbitMQ 4.x refuses transient non-exclusive queues.** The default consumer queue is durable
   and unaffected. If you pass `consumerQueueOptions` with `durable: false`, also set
   `exclusive: true`; otherwise the broker closes the connection on declare.
-- **Reconnect is connection-level.** Channel-only closures are not handled, and deliveries
-  received before a reconnect cannot be acknowledged afterwards (the broker redelivers them). In
-  passive mode, a consumer whose queue disappeared while it was disconnected stops, and `health()`
-  reports `consumerActive: false` with the reason in `details.topologyError`; it does not retry.
 
 ---
 
@@ -447,8 +470,18 @@ The integration suite covers:
   rebind the topology, are refused with `ACCESS_REFUSED`
 - Every event carries the node's `user_id`, and an event with a forged `user_id` closes the
   channel with `PRECONDITION_FAILED`
-- After the broker drops the connection, a passive consumer whose queue has gone stops and
-  reports why, with no reconnect loop, while the publisher keeps working
+- After the broker drops the connection, a passive consumer whose queue is deleted while it is
+  disconnected stops and reports why, with no reconnect loop, while the publisher keeps working
+- A job in flight when the broker drops the connection is delivered again on the new connection
+  with the same delivery tag: the old handler's `ack` is refused with an `EdgeStaleDeliveryError`
+  and sends nothing, the redelivery is acked, and the next job runs
+- A consumer channel the broker closes (an ack of an unknown delivery tag, `PRECONDITION_FAILED`),
+  twice in a row, is reopened on the same connection, and the job in flight is delivered again
+- A publish to a deleted events exchange closes only the publisher channel: the publish rejects
+  with an `EdgePublishError` (`channel-closed`), the next one with an `EdgeTopologyError`, and
+  publishing resumes on the same connection once the exchange is back
+- A passive consumer whose queue is deleted while it is connected (the broker cancels its
+  subscription) stops and reports why
 
 The least-privilege tests create a vhost and a broker user through the RabbitMQ management API,
 then delete them. By default they use port 15672 on the broker host (the docker compose file

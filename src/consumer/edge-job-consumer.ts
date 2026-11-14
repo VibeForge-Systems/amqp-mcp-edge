@@ -21,6 +21,32 @@ export interface JobDeliveryContext {
    * redelivered.
    */
   deliveryAttempt?: number;
+  /**
+   * Which subscription of this consumer the job arrived on. The consumer subscribes again after a
+   * reconnect, after the broker closes its channel, and after the broker cancels its subscription,
+   * and delivery tags restart on a new channel; `ack` and `nack` use this with `deliveryTag` to
+   * refuse a delivery from a subscription that has ended. Pass the context the handler received.
+   */
+  subscriptionId?: number;
+}
+
+/**
+ * `ack` or `nack` named a delivery from a subscription that has ended: its channel closed (a
+ * reconnect, or the broker closed it), the broker cancelled the subscription, or the consumer was
+ * stopped. Nothing was sent to the broker. A job left unsettled on a closed channel goes back to
+ * its queue and is delivered again, marked redelivered.
+ */
+export class EdgeStaleDeliveryError extends Error {
+  public readonly deliveryTag: number;
+
+  public constructor(deliveryTag: number, options: { cause?: unknown } = {}) {
+    super(
+      `delivery ${deliveryTag} is from a subscription that has ended, so it can no longer be acked or nacked; nothing was sent to the broker`,
+      options,
+    );
+    this.name = 'EdgeStaleDeliveryError';
+    this.deliveryTag = deliveryTag;
+  }
 }
 
 /** What the consumer needs to report a job it gives up on. `createEdgeChannel` passes its publisher. */
@@ -28,9 +54,18 @@ export interface EdgeJobConsumerOptions {
   failurePublisher?: { publishFailure(message: JobFailureEvent): Promise<void> };
 }
 
+interface Subscription {
+  id: number;
+  channel: Channel;
+  consumerTag?: string;
+  ended: boolean;
+  onChannelClose: () => void;
+}
+
 interface PendingDelivery {
   message: ConsumeMessage;
   attemptKey: string;
+  subscription: Subscription;
 }
 
 // Requeue counts are kept per job attempt for this many attempts at most; the oldest is forgotten
@@ -143,6 +178,7 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
 
   private jobHandler: EdgeJobHandler = async () => undefined;
 
+  // Keyed by delivery tag. Every entry belongs to a live subscription: entries go when theirs ends.
   private readonly pendingDeliveries = new Map<number, PendingDelivery>();
 
   private readonly requeueCounts = new Map<string, number>();
@@ -153,9 +189,22 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
 
   private lastFailureReportError?: string;
 
-  private consumerActive = false;
+  // start() was called and stop() was not: the consumer subscribes again whenever it can.
+  private started = false;
 
-  private consumerTag?: string;
+  private subscription?: Subscription;
+
+  private subscribing?: Promise<void>;
+
+  private readonly liveSubscriptions = new Map<number, Subscription>();
+
+  private subscriptionCount = 0;
+
+  private discardedDeliveries = 0;
+
+  private brokerCancellations = 0;
+
+  private lastResubscribeError?: string;
 
   private topologyVerification?: Promise<void>;
 
@@ -175,30 +224,9 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
     this.config = resolveConfig(config);
     this.connectionManager = connectionManager;
     this.failurePublisher = options.failurePublisher;
-    connectionManager.onReconnect(async () => {
-      // A new connection may reach a broker whose topology changed while this node was away, so a
-      // passive-mode consumer checks its queue again, once, before it subscribes.
-      this.topologyVerification = undefined;
-
-      if (!this.consumerActive) {
-        return;
-      }
-
-      try {
-        await this.initializeConsumer();
-      } catch (error) {
-        if (!(error instanceof EdgeTopologyError)) {
-          throw error;
-        }
-
-        // The check failed on its own channel, so the connection is still up and nothing else
-        // reconnects. Stop consuming instead of retrying: restoring the topology is the control
-        // plane's job, not this node's. health() reports the reason.
-        this.consumerActive = false;
-        this.consumerTag = undefined;
-        this.pendingDeliveries.clear();
-      }
-    });
+    // The old subscription ended when its channel closed; subscribe again on the new one.
+    connectionManager.onReconnect(() => this.resubscribe());
+    connectionManager.onChannelReopened('consumer', () => this.resubscribe());
   }
 
   public onJob(handler: EdgeJobHandler): void {
@@ -206,35 +234,50 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
   }
 
   public async start(): Promise<void> {
-    if (this.consumerActive) {
+    if (this.started) {
       return;
     }
 
-    await this.initializeConsumer();
-    this.consumerActive = true;
+    // Started before subscribing, so a channel that closes meanwhile is subscribed again.
+    this.started = true;
+
+    try {
+      await this.subscribe();
+    } catch (error) {
+      this.started = false;
+      throw error;
+    }
   }
 
+  /**
+   * Cancels the subscription. Jobs still unsettled stay unacked on the channel until it closes,
+   * when the broker delivers them again; their contexts can no longer be acked or nacked.
+   */
   public async stop(): Promise<void> {
-    if (!this.consumerActive) {
+    if (!this.started) {
       return;
     }
 
-    const channel = await this.connectionManager.getConsumerChannel();
+    this.started = false;
+    await this.subscribing?.catch(() => undefined);
+    const subscription = this.subscription;
 
-    if (this.consumerTag) {
-      await channel.cancel(this.consumerTag).catch(() => undefined);
-      this.consumerTag = undefined;
+    if (subscription) {
+      if (subscription.consumerTag) {
+        await subscription.channel.cancel(subscription.consumerTag).catch(() => undefined);
+      }
+
+      this.endSubscription(subscription);
     }
-
-    this.consumerActive = false;
-    this.pendingDeliveries.clear();
   }
 
+  /**
+   * Acks a job. Rejects with an `EdgeStaleDeliveryError`, sending nothing, when the delivery's
+   * subscription has ended: the broker no longer knows its delivery tag.
+   */
   public async ack(delivery: JobDeliveryContext): Promise<void> {
-    const pending = this.getPendingDelivery(delivery.deliveryTag);
-    const channel = await this.connectionManager.getConsumerChannel();
-    channel.ack(pending.message);
-    this.pendingDeliveries.delete(pending.message.fields.deliveryTag);
+    const pending = this.getPendingDelivery(delivery);
+    this.settle(pending, (channel, message) => channel.ack(message));
     this.requeueCounts.delete(pending.attemptKey);
   }
 
@@ -242,14 +285,12 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
    * Rejects a job. With `requeue: true` the broker delivers it again, and the next delivery's
    * `deliveryAttempt` counts this requeue; the consumer does not limit requeues a handler asks for,
    * so a handler that requeues should check `deliveryAttempt` itself. Without it (the default) the
-   * job is dead-lettered.
+   * job is dead-lettered. Rejects with an `EdgeStaleDeliveryError` as `ack` does.
    */
   public async nack(delivery: JobDeliveryContext, options: { requeue?: boolean; reason?: string } = {}): Promise<void> {
-    const pending = this.getPendingDelivery(delivery.deliveryTag);
+    const pending = this.getPendingDelivery(delivery);
     const requeue = options.requeue ?? false;
-    const channel = await this.connectionManager.getConsumerChannel();
-    channel.nack(pending.message, false, requeue);
-    this.pendingDeliveries.delete(pending.message.fields.deliveryTag);
+    this.settle(pending, (channel, message) => channel.nack(message, false, requeue));
 
     if (requeue) {
       this.countRequeue(pending.attemptKey);
@@ -261,13 +302,20 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
   public async health(): Promise<EdgeChannelHealth> {
     const connectionHealth = await this.connectionManager.health();
 
+    // consumerActive comes from the connection manager: true only while this consumer's
+    // subscription is on the open consumer channel.
     return createHealthSnapshot({
       connected: connectionHealth.connected,
-      consumerActive: this.consumerActive,
+      consumerActive: connectionHealth.consumerActive,
       publisherActive: connectionHealth.publisherActive,
       details: {
+        // The connection's reconnect state and channel reopens, then this consumer's own details.
+        ...connectionHealth.details,
         pendingDeliveries: this.pendingDeliveries.size,
         maxDeliveryAttempts: this.config.maxDeliveryAttempts,
+        ...(this.discardedDeliveries > 0 ? { discardedDeliveries: this.discardedDeliveries } : {}),
+        ...(this.brokerCancellations > 0 ? { brokerCancellations: this.brokerCancellations } : {}),
+        ...(this.lastResubscribeError ? { lastResubscribeError: this.lastResubscribeError } : {}),
         ...(this.topologyError ? { topologyError: this.topologyError.message } : {}),
         ...(this.failureReportErrors > 0
           ? { failureReportErrors: this.failureReportErrors, lastFailureReportError: this.lastFailureReportError }
@@ -314,8 +362,46 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
     await checkTopology(channel, [{ kind: 'queue', name: buildConsumerQueueName(this.config) }]);
   }
 
+  // One subscription attempt at a time; concurrent callers share it.
+  private subscribe(): Promise<void> {
+    if (!this.subscribing) {
+      const subscribing = this.initializeConsumer().finally(() => {
+        if (this.subscribing === subscribing) {
+          this.subscribing = undefined;
+        }
+      });
+      this.subscribing = subscribing;
+    }
+
+    return this.subscribing;
+  }
+
+  /**
+   * Subscribes again after the subscription ended with its channel or was cancelled by the broker.
+   * A new channel may reach a broker whose topology changed meanwhile, so a passive-mode consumer
+   * checks its queue again, once, first. If the queue is gone it stops instead of retrying:
+   * restoring the topology is the control plane's job, not this node's, and health() reports why.
+   */
+  private async resubscribe(): Promise<void> {
+    this.topologyVerification = undefined;
+
+    while (this.started && !this.subscription) {
+      try {
+        await this.subscribe();
+        this.lastResubscribeError = undefined;
+      } catch (error) {
+        if (error instanceof EdgeTopologyError) {
+          this.started = false;
+          return;
+        }
+
+        this.lastResubscribeError = error instanceof Error ? error.message : String(error);
+        throw error;
+      }
+    }
+  }
+
   private async initializeConsumer(): Promise<void> {
-    const existingTag = this.consumerTag;
     const queueName = buildConsumerQueueName(this.config);
 
     if (this.config.topologyMode === 'passive') {
@@ -330,21 +416,76 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
 
     await channel.prefetch(this.config.prefetchCount);
 
-    const consumeResult = await channel.consume(
-      queueName,
-      (message) => {
-        void this.handleMessage(channel, message);
-      },
-      {
-        consumerTag: this.config.consumerTag,
-      },
-    );
+    this.subscriptionCount += 1;
+    const subscription: Subscription = {
+      id: this.subscriptionCount,
+      channel,
+      ended: false,
+      // A channel that closes ends its subscription: the broker returns the unacked jobs to the
+      // queue, and their delivery tags mean nothing on any other channel.
+      onChannelClose: () => this.endSubscription(subscription),
+    };
+    this.liveSubscriptions.set(subscription.id, subscription);
+    channel.once('close', subscription.onChannelClose);
 
-    if (existingTag) {
-      await channel.cancel(existingTag).catch(() => undefined);
+    try {
+      const { consumerTag } = await channel.consume(
+        queueName,
+        (message) => {
+          void this.handleMessage(subscription, message);
+        },
+        {
+          consumerTag: this.config.consumerTag,
+        },
+      );
+      subscription.consumerTag = consumerTag;
+    } catch (error) {
+      this.endSubscription(subscription);
+      throw error;
     }
 
-    this.consumerTag = consumeResult.consumerTag;
+    if (subscription.ended) {
+      // The channel closed before the broker confirmed the subscription; resubscribe() tries again.
+      return;
+    }
+
+    this.subscription = subscription;
+    this.connectionManager.reportActive('consumer', channel);
+  }
+
+  // Forgets a subscription and the deliveries still pending on it.
+  private endSubscription(subscription: Subscription): void {
+    if (subscription.ended) {
+      return;
+    }
+
+    subscription.ended = true;
+    subscription.channel.off('close', subscription.onChannelClose);
+    this.liveSubscriptions.delete(subscription.id);
+
+    for (const [deliveryTag, pending] of this.pendingDeliveries) {
+      if (pending.subscription === subscription) {
+        this.pendingDeliveries.delete(deliveryTag);
+        this.discardedDeliveries += 1;
+      }
+    }
+
+    if (this.subscription === subscription) {
+      this.subscription = undefined;
+      this.connectionManager.reportInactive('consumer');
+    }
+  }
+
+  // The broker cancelled the subscription, for example because the queue was deleted. Subscribe
+  // again; in passive mode that checks the queue first.
+  private handleBrokerCancel(subscription: Subscription): void {
+    if (subscription.ended) {
+      return;
+    }
+
+    this.brokerCancellations += 1;
+    this.endSubscription(subscription);
+    void this.resubscribe().catch(() => undefined);
   }
 
   private async declareTopology(channel: Channel, queueName: string): Promise<void> {
@@ -367,13 +508,28 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
     }
   }
 
-  private async handleMessage(channel: Channel, message: ConsumeMessage | null): Promise<void> {
+  private async handleMessage(subscription: Subscription, message: ConsumeMessage | null): Promise<void> {
     if (!message) {
+      this.handleBrokerCancel(subscription);
       return;
     }
 
+    if (subscription.ended) {
+      return;
+    }
+
+    // An invalid message is dead-lettered on the channel it arrived on. If that channel has just
+    // closed, amqplib throws, and the broker delivers the message again.
+    const reject = () => {
+      try {
+        subscription.channel.nack(message, false, false);
+      } catch {
+        // The channel closed; nothing to do.
+      }
+    };
+
     if (message.content.byteLength > this.config.maxMessageSizeBytes) {
-      channel.nack(message, false, false);
+      reject();
       return;
     }
 
@@ -382,7 +538,7 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
     try {
       parsedPayload = JSON.parse(message.content.toString('utf8'));
     } catch {
-      channel.nack(message, false, false);
+      reject();
       return;
     }
 
@@ -401,7 +557,7 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
 
       envelope = validatedEnvelope;
     } catch {
-      channel.nack(message, false, false);
+      reject();
       return;
     }
 
@@ -414,26 +570,36 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
       routingKey: message.fields.routingKey,
       redelivered: message.fields.redelivered,
       deliveryAttempt,
+      subscriptionId: subscription.id,
     };
 
-    this.pendingDeliveries.set(message.fields.deliveryTag, { message, attemptKey });
+    this.pendingDeliveries.set(message.fields.deliveryTag, { message, attemptKey, subscription });
 
     try {
       await this.jobHandler(envelope, context);
     } catch (error) {
-      if (!this.pendingDeliveries.has(message.fields.deliveryTag)) {
-        // The handler acked or nacked before it threw; that outcome stands.
+      if (this.pendingDeliveries.get(message.fields.deliveryTag)?.message !== message) {
+        // The handler acked or nacked before it threw, and that outcome stands; or the
+        // subscription ended while it ran, and the broker delivers the job again.
         return;
       }
 
-      if (deliveryAttempt < this.config.maxDeliveryAttempts) {
-        await this.nack(context, { requeue: true });
-        return;
-      }
+      try {
+        if (deliveryAttempt < this.config.maxDeliveryAttempts) {
+          await this.nack(context, { requeue: true });
+          return;
+        }
 
-      // The last attempt: tell the control plane before the job leaves for the dead-letter queue.
-      await this.reportExhausted(envelope, deliveryAttempt, error);
-      await this.nack(context, { requeue: false });
+        // The last attempt: tell the control plane before the job leaves for the dead-letter queue.
+        await this.reportExhausted(envelope, deliveryAttempt, error);
+        await this.nack(context, { requeue: false });
+      } catch (settleError) {
+        if (!(settleError instanceof EdgeStaleDeliveryError)) {
+          throw settleError;
+        }
+
+        // The subscription ended while the handler ran; the broker delivers the job again.
+      }
     }
   }
 
@@ -490,11 +656,20 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
     }
   }
 
-  private getPendingDelivery(deliveryTag?: number): PendingDelivery {
+  private getPendingDelivery(delivery: JobDeliveryContext): PendingDelivery {
+    const { deliveryTag, subscriptionId } = delivery;
+
     if (deliveryTag === undefined) {
       throw new Error('deliveryTag is required');
     }
 
+    if (subscriptionId !== undefined && !this.liveSubscriptions.has(subscriptionId)) {
+      throw new EdgeStaleDeliveryError(deliveryTag);
+    }
+
+    // Delivery tags are unique among live subscriptions: an ended one has no pending entries, and
+    // a later one on the same channel continues its tags. So a context without subscriptionId (one
+    // the caller built) names a delivery of the current subscription.
     const pending = this.pendingDeliveries.get(deliveryTag);
 
     if (!pending) {
@@ -502,5 +677,20 @@ export class EdgeJobConsumer implements EdgeJobConsumer {
     }
 
     return pending;
+  }
+
+  // Acks or nacks on the channel the job arrived on, never on a newer one.
+  private settle(pending: PendingDelivery, send: (channel: Channel, message: ConsumeMessage) => void): void {
+    const { deliveryTag } = pending.message.fields;
+
+    try {
+      send(pending.subscription.channel, pending.message);
+    } catch (error) {
+      // amqplib throws when the channel has closed.
+      this.pendingDeliveries.delete(deliveryTag);
+      throw new EdgeStaleDeliveryError(deliveryTag, { cause: error });
+    }
+
+    this.pendingDeliveries.delete(deliveryTag);
   }
 }

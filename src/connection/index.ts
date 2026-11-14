@@ -64,4 +64,5 @@ export async function createEdgeChannel(config: EdgeChannelConfig): Promise<Edge
 }
 
 export { EdgeChannelConnectionManager } from './connection-manager.js';
+export type { EdgeChannelKind } from './connection-manager.js';
 export { EdgeTopologyError } from '../topology/index.js';

@@ -17,9 +17,12 @@ import {
   createEdgeChannel,
   defaultExchangeConfig,
   EdgeChannelConnectionManager,
+  EdgeEventPublisher,
   EdgeJobConsumer,
   EdgePublishError,
+  EdgeStaleDeliveryError,
   EdgeTopologyError,
+  type JobDeliveryContext,
   packageInstallResultOutputSchema,
   parseEventRoutingKey,
   parsePackageInstallJob,
@@ -1125,7 +1128,8 @@ test('least privilege: after a reconnect a passive consumer whose queue is gone 
     siteId: harness.siteId,
     nodeId: harness.nodeId,
     topologyMode: 'passive',
-    reconnectDelayMs: 100,
+    // Long enough to delete the queue while the node is disconnected.
+    reconnectDelayMs: 1000,
     connectionName,
   });
   harness.cleanup.defer(() => edgeChannel.close());
@@ -1142,15 +1146,22 @@ test('least privilege: after a reconnect a passive consumer whose queue is gone 
     return connections.length === 1 ? connections : undefined;
   });
 
-  // The queue disappears while the node is connected, then the broker drops the connection.
-  await harness.controlChannel.deleteQueue(harness.queueName);
+  // The broker drops the connection, and the queue disappears while the node is disconnected. (A
+  // queue deleted while the node is connected is the broker-cancel test below.)
   await managementRequest(api, 'DELETE', `/api/connections/${encodeURIComponent(original!.name)}`);
+  await waitFor('the node to see the connection drop', 5000, async () => {
+    const health = await edgeChannel.consumer.health();
+    return health.connected === false ? health : undefined;
+  });
+  await harness.controlChannel.deleteQueue(harness.queueName);
 
   const stopped = await waitFor('the consumer to stop', 15000, async () => {
     const health = await edgeChannel.consumer.health();
-    return health.consumerActive === false ? health : undefined;
+    return health.connected && health.consumerActive === false && health.details?.topologyError !== undefined ? health : undefined;
   });
   assert.match(String(stopped.details?.topologyError), new RegExp(`queue '${escapeRegExp(harness.queueName)}' does not exist`));
+  // It stopped on the reconnect's check, not on a broker cancel.
+  assert.equal(stopped.details?.brokerCancellations, undefined);
 
   // One new connection, still up: the failed check closed only its own channel.
   await sleep(1000);
@@ -1473,4 +1484,321 @@ test('publisher confirms: an event the broker nacks rejects the publish, and the
   // Nothing was enqueued on the refusing queue.
   const { messageCount } = await withChannel(harness.controlConnection, (channel) => channel.checkQueue(fullQueue));
   assert.equal(messageCount, 0);
+});
+
+// --- Reconnects and channel closes ----------------------------------------------------------------
+
+type ExecutionJob = ReturnType<typeof createExecutionJob>;
+
+// The node's connections, as the broker lists them.
+function listNodeConnections(api: ManagementApi, harness: LeastPrivilegeHarness, connectionName: string) {
+  return managementGet<Array<{ name: string; client_properties?: { connection_name?: string } }>>(
+    api,
+    `/api/vhosts/${encodeURIComponent(harness.vhost)}/connections`,
+  ).then((connections) => connections.filter((connection) => connection.client_properties?.connection_name === connectionName));
+}
+
+function publishJob(harness: LeastPrivilegeHarness, name: string): ExecutionJob {
+  const job = createExecutionJob({
+    messageId: `${name}-${harness.runId}`,
+    payload: {
+      ...createExecutionJob().payload,
+      jobId: `${name}-${harness.runId}`,
+      attemptId: `attempt-${name}-${harness.runId}`,
+      target: { siteId: harness.siteId, nodeId: harness.nodeId },
+    },
+  });
+  harness.controlChannel.publish(
+    defaultExchangeConfig.jobsExchange,
+    buildJobRoutingKey(job.payload.target, job.payload.capability),
+    Buffer.from(JSON.stringify(job), 'utf8'),
+    { contentType: 'application/json', messageId: job.messageId, userId: harness.adminUser },
+  );
+  return job;
+}
+
+// A worker whose handler holds every job until the test releases it, then acks it, and records how
+// that ack went.
+function holdingWorker(consumer: Pick<EdgeJobConsumer, 'onJob' | 'ack'>) {
+  const held: Array<{ jobId: string; delivery: JobDeliveryContext; release: () => void }> = [];
+  const outcomes: string[] = [];
+
+  consumer.onJob(async (job, delivery) => {
+    let release = () => undefined as void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    held.push({ jobId: job.payload.jobId, delivery, release });
+    await released;
+
+    try {
+      await consumer.ack(delivery);
+      outcomes.push(`acked ${job.payload.jobId}`);
+    } catch (error) {
+      outcomes.push(error instanceof EdgeStaleDeliveryError ? `stale ${job.payload.jobId}` : `failed ${job.payload.jobId}: ${String(error)}`);
+    }
+  });
+
+  const heldCount = (count: number) => waitFor(`${count} held deliveries`, 15000, async () => (held.length >= count ? held : undefined));
+  const outcomeCount = (count: number) => waitFor(`${count} outcomes`, 15000, async () => (outcomes.length >= count ? outcomes : undefined));
+  return { held, outcomes, heldCount, outcomeCount };
+}
+
+// The node's queue holds nothing, acked or not: closing every node connection returns an unacked
+// job to the ready count.
+async function assertNodeQueueEmpty(harness: LeastPrivilegeHarness): Promise<void> {
+  const { messageCount } = await withChannel(harness.controlConnection, (channel) => channel.checkQueue(harness.queueName));
+  assert.equal(messageCount, 0);
+}
+
+function nodeChannel(harness: LeastPrivilegeHarness, connectionName: string) {
+  const config = {
+    amqpUrl: harness.nodeAmqpUrl,
+    siteId: harness.siteId,
+    nodeId: harness.nodeId,
+    topologyMode: 'passive' as const,
+    runtimeConsumerVersion: '0.1.0',
+    runtimeProducerVersion: '0.1.0',
+    reconnectDelayMs: 100,
+    connectionName,
+  };
+  const connectionManager = new EdgeChannelConnectionManager(config);
+  const publisher = new EdgeEventPublisher(config, connectionManager);
+  const consumer = new EdgeJobConsumer(config, connectionManager, { failurePublisher: publisher });
+  return { connectionManager, publisher, consumer };
+}
+
+test('reconnect: a job in flight when the connection drops is redelivered, and its old delivery cannot be acked', { timeout: 60000 }, async (t) => {
+  const api = await managementApiOrSkip(t);
+  if (!api) {
+    return;
+  }
+
+  const harness = await createLeastPrivilegeHarness(t, api);
+  const connectionName = `amqp-mcp-edge-inflight-${harness.runId}`;
+  const { connectionManager, consumer, publisher } = nodeChannel(harness, connectionName);
+  harness.cleanup.defer(() => connectionManager.close());
+  const worker = holdingWorker(consumer);
+  await consumer.start();
+  const ack = (name: string) =>
+    createAckMessage({ messageId: `${name}-${harness.runId}`, payload: { ...createAckMessage().payload, siteId: harness.siteId, nodeId: harness.nodeId } });
+  await publisher.publishAck(ack('before'));
+  // Each component's health reports the other too.
+  assert.equal((await consumer.health()).publisherActive, true);
+  assert.equal((await publisher.health()).consumerActive, true);
+
+  const [original] = await waitFor('the node connection to be listed', 15000, async () => {
+    const connections = await listNodeConnections(api, harness, connectionName);
+    return connections.length === 1 ? connections : undefined;
+  });
+
+  publishJob(harness, 'job-1');
+  const [first] = await worker.heldCount(1);
+  assert.equal(first!.delivery.redelivered, false);
+
+  // The broker drops the connection with job 1 unacked, so it delivers job 1 again on the new
+  // connection, where delivery tags start over: the redelivery has the same tag.
+  await managementRequest(api, 'DELETE', `/api/connections/${encodeURIComponent(original!.name)}`);
+  const [, second] = await worker.heldCount(2);
+  assert.equal(second!.jobId, first!.jobId);
+  assert.equal(second!.delivery.redelivered, true);
+  assert.equal(second!.delivery.deliveryAttempt, 2);
+  assert.equal(second!.delivery.deliveryTag, first!.delivery.deliveryTag);
+
+  // The consumer has subscribed on the new connection. The publisher has not published on it yet,
+  // so it is not reported active until it does.
+  let health = await publisher.health();
+  assert.equal(health.connected, true);
+  assert.equal(health.consumerActive, true);
+  assert.equal(health.publisherActive, false);
+  await publisher.publishAck(ack('after'));
+  health = await publisher.health();
+  assert.equal(health.publisherActive, true);
+
+  // The first handler finishes: its ack is refused, without reaching the broker. Sent on the new
+  // channel it would have acked the redelivery (same tag) under the second handler's feet.
+  first!.release();
+  assert.deepEqual(await worker.outcomeCount(1), [`stale ${first!.jobId}`]);
+  second!.release();
+  assert.deepEqual(await worker.outcomeCount(2), [`stale ${first!.jobId}`, `acked ${first!.jobId}`]);
+
+  // The new consumer channel is still open: the next job runs on it.
+  publishJob(harness, 'job-2');
+  const [, , third] = await worker.heldCount(3);
+  third!.release();
+  assert.deepEqual((await worker.outcomeCount(3)).at(-1), `acked ${third!.jobId}`);
+
+  const consumerHealth = await consumer.health();
+  assert.equal(consumerHealth.connected, true);
+  assert.equal(consumerHealth.consumerActive, true);
+  assert.equal(consumerHealth.details?.discardedDeliveries, 1);
+  assert.equal(consumerHealth.details?.pendingDeliveries, 0);
+  const connectionHealth = await connectionManager.health();
+  assert.equal(connectionHealth.details?.consumerChannelReopens, 0);
+  assert.equal(connectionHealth.details?.lastChannelError, undefined);
+  // One replacement connection; the management API lists it a little later.
+  await waitFor('the replacement connection to be listed', 15000, async () => {
+    const connections = await listNodeConnections(api, harness, connectionName);
+    return connections.length === 1 && connections[0]?.name !== original!.name ? connections : undefined;
+  });
+
+  await connectionManager.close();
+  await assertNodeQueueEmpty(harness);
+});
+
+test('channel close: a consumer channel the broker closes is reopened on the same connection, and the job is redelivered', { timeout: 60000 }, async (t) => {
+  const api = await managementApiOrSkip(t);
+  if (!api) {
+    return;
+  }
+
+  const harness = await createLeastPrivilegeHarness(t, api);
+  const connectionName = `amqp-mcp-edge-channel-${harness.runId}`;
+  const { connectionManager, consumer } = nodeChannel(harness, connectionName);
+  harness.cleanup.defer(() => connectionManager.close());
+  const worker = holdingWorker(consumer);
+  await consumer.start();
+
+  const [original] = await waitFor('the node connection to be listed', 15000, async () => {
+    const connections = await listNodeConnections(api, harness, connectionName);
+    return connections.length === 1 ? connections : undefined;
+  });
+
+  publishJob(harness, 'job-1');
+  const [first] = await worker.heldCount(1);
+
+  // An ack of a delivery tag the broker never sent makes it close the channel with
+  // PRECONDITION_FAILED, as an ack of a tag from an earlier channel did before this fix.
+  const brokerClose = async () => {
+    const channel = await connectionManager.getConsumerChannel();
+    channel.ack({ fields: { deliveryTag: 999 } } as ConsumeMessage);
+  };
+  await brokerClose();
+
+  const [, second] = await worker.heldCount(2);
+  assert.equal(second!.jobId, first!.jobId);
+  assert.equal(second!.delivery.redelivered, true);
+  let connectionHealth = await connectionManager.health();
+  assert.equal(connectionHealth.connected, true);
+  assert.equal(connectionHealth.details?.consumerChannelReopens, 1);
+  assert.match(String(connectionHealth.details?.lastChannelError), /PRECONDITION_FAILED - unknown delivery tag 999/);
+
+  first!.release();
+  assert.deepEqual(await worker.outcomeCount(1), [`stale ${first!.jobId}`]);
+
+  // A second close soon after the first is reopened too, after the reconnect delay.
+  await brokerClose();
+  const [, , third] = await worker.heldCount(3);
+  assert.equal(third!.jobId, first!.jobId);
+  second!.release();
+  third!.release();
+  assert.deepEqual((await worker.outcomeCount(3)).slice(1).sort(), [`acked ${first!.jobId}`, `stale ${first!.jobId}`].sort());
+
+  publishJob(harness, 'job-2');
+  const [, , , fourth] = await worker.heldCount(4);
+  fourth!.release();
+  assert.equal((await worker.outcomeCount(4)).at(-1), `acked ${fourth!.jobId}`);
+
+  // All of it on the connection the node opened first.
+  const connections = await listNodeConnections(api, harness, connectionName);
+  assert.deepEqual(connections.map((connection) => connection.name), [original!.name]);
+  connectionHealth = await connectionManager.health();
+  assert.equal(connectionHealth.details?.consumerChannelReopens, 2);
+  assert.equal(connectionHealth.details?.reconnectAttempts, 0);
+  assert.equal(connectionHealth.consumerActive, true);
+  // The consumer's own snapshot carries the connection's details too.
+  const consumerHealth = await consumer.health();
+  assert.equal(consumerHealth.details?.discardedDeliveries, 2);
+  assert.equal(consumerHealth.details?.consumerChannelReopens, 2);
+  assert.match(String(consumerHealth.details?.lastChannelError), /PRECONDITION_FAILED/);
+
+  await connectionManager.close();
+  await assertNodeQueueEmpty(harness);
+});
+
+test('channel close: a publish to a deleted events exchange closes only the publisher channel, which is reopened and checks the exchange again', { timeout: 60000 }, async (t) => {
+  const api = await managementApiOrSkip(t);
+  if (!api) {
+    return;
+  }
+
+  const harness = await createLeastPrivilegeHarness(t, api);
+  const { eventsExchange } = defaultExchangeConfig;
+  const connectionName = `amqp-mcp-edge-publisher-${harness.runId}`;
+  const { connectionManager, publisher } = nodeChannel(harness, connectionName);
+  harness.cleanup.defer(() => connectionManager.close());
+  const ack = (name: string) =>
+    createAckMessage({ messageId: `${name}-${harness.runId}`, payload: { ...createAckMessage().payload, siteId: harness.siteId, nodeId: harness.nodeId } });
+
+  const received = collectDeliveries(harness.controlChannel, harness.controlQueueName, 2, 20000);
+  await publisher.publishAck(ack('before'));
+  assert.equal((await publisher.health()).publisherActive, true);
+  const [original] = await waitFor('the node connection to be listed', 15000, async () => {
+    const connections = await listNodeConnections(api, harness, connectionName);
+    return connections.length === 1 ? connections : undefined;
+  });
+
+  // The exchange disappears. The broker answers the next publish by closing the channel (404).
+  await harness.controlChannel.deleteExchange(eventsExchange);
+  await assert.rejects(
+    () => publisher.publishAck(ack('lost')),
+    (error: unknown) => error instanceof EdgePublishError && error.reason === 'channel-closed',
+  );
+  assert.equal((await publisher.health()).publisherActive, false);
+
+  const reopened = await waitFor('the publisher channel to be reopened', 15000, async () => {
+    const health = await connectionManager.health();
+    return health.details?.publisherChannelReopens === 1 ? health : undefined;
+  });
+  assert.equal(reopened.connected, true);
+  assert.match(String(reopened.details?.lastChannelError), /NOT_FOUND - no exchange 'mcp\.edge\.events'/);
+
+  // The reopened channel checks the exchange before it publishes, so the node learns why.
+  await assert.rejects(
+    () => publisher.publishAck(ack('missing')),
+    (error: unknown) => error instanceof EdgeTopologyError && error.kind === 'exchange' && error.entityName === eventsExchange,
+  );
+
+  // Once the control plane restores the exchange, publishing works again, on the same connection.
+  await harness.controlChannel.assertExchange(eventsExchange, 'topic', { durable: true });
+  await harness.controlChannel.bindQueue(harness.controlQueueName, eventsExchange, `edge.event.*.${harness.siteId}.${harness.nodeId}`);
+  await publisher.publishAck(ack('after'));
+  const publisherHealth = await publisher.health();
+  assert.equal(publisherHealth.publisherActive, true);
+  assert.equal(publisherHealth.details?.publisherChannelReopens, 1);
+  assert.equal(publisherHealth.details?.consumerChannelReopens, 0);
+
+  const messages = await received;
+  assert.deepEqual(messages.map((message) => message.properties.messageId), [`before-${harness.runId}`, `after-${harness.runId}`]);
+  const connections = await listNodeConnections(api, harness, connectionName);
+  assert.deepEqual(connections.map((connection) => connection.name), [original!.name]);
+  assert.equal((await connectionManager.health()).details?.reconnectAttempts, 0);
+});
+
+test('broker cancel: a passive consumer whose queue is deleted while it is connected stops and reports it', { timeout: 60000 }, async (t) => {
+  const api = await managementApiOrSkip(t);
+  if (!api) {
+    return;
+  }
+
+  const harness = await createLeastPrivilegeHarness(t, api);
+  const connectionName = `amqp-mcp-edge-cancel-${harness.runId}`;
+  const { connectionManager, consumer } = nodeChannel(harness, connectionName);
+  harness.cleanup.defer(() => connectionManager.close());
+  await consumer.start();
+  assert.equal((await consumer.health()).consumerActive, true);
+
+  await harness.controlChannel.deleteQueue(harness.queueName);
+
+  // The broker cancels the subscription; the consumer checks its queue again, finds it gone, stops.
+  const stopped = await waitFor('the consumer to stop', 15000, async () => {
+    const health = await consumer.health();
+    return health.consumerActive === false && health.details?.topologyError !== undefined ? health : undefined;
+  });
+  assert.equal(stopped.connected, true);
+  assert.equal(stopped.details?.brokerCancellations, 1);
+  assert.match(String(stopped.details?.topologyError), new RegExp(`queue '${escapeRegExp(harness.queueName)}' does not exist`));
+  const connectionHealth = await connectionManager.health();
+  assert.equal(connectionHealth.details?.consumerChannelReopens, 0);
+  assert.equal(connectionHealth.details?.reconnectAttempts, 0);
 });

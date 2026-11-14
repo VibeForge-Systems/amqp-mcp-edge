@@ -36,18 +36,23 @@ export interface MockDeliveryRecord {
   requeue?: boolean;
 }
 
+// What the real connection manager tracks for both components, so each health() reports both.
+interface MockComponentState {
+  consumerActive: boolean;
+  publisherActive: boolean;
+}
+
 class MockEdgeJobConsumer {
   private readonly deliveries = new Map<number, MockDeliveryRecord>();
 
   private jobHandler: EdgeJobHandler = async () => undefined;
-
-  private active = false;
 
   private nextDeliveryTag = 1;
 
   public constructor(
     private readonly config: ResolvedEdgeChannelConfig,
     private readonly publisher: MockEdgeEventPublisher,
+    private readonly state: MockComponentState,
   ) {}
 
   public onJob(handler: EdgeJobHandler): void {
@@ -55,11 +60,11 @@ class MockEdgeJobConsumer {
   }
 
   public async start(): Promise<void> {
-    this.active = true;
+    this.state.consumerActive = true;
   }
 
   public async stop(): Promise<void> {
-    this.active = false;
+    this.state.consumerActive = false;
     this.deliveries.clear();
   }
 
@@ -77,7 +82,8 @@ class MockEdgeJobConsumer {
   public async health(): Promise<EdgeChannelHealth> {
     return createHealthSnapshot({
       connected: true,
-      consumerActive: this.active,
+      consumerActive: this.state.consumerActive,
+      publisherActive: this.state.publisherActive,
       details: {
         deliveries: this.deliveries.size,
       },
@@ -85,7 +91,7 @@ class MockEdgeJobConsumer {
   }
 
   public async dispatchJob(job: ExecutionJobEnvelope, deliveryOverrides: Partial<JobDeliveryContext> = {}): Promise<JobDeliveryContext> {
-    if (!this.active) {
+    if (!this.state.consumerActive) {
       throw new Error('mock consumer is not active');
     }
 
@@ -162,9 +168,10 @@ class MockEdgeEventPublisher {
 
   private readonly publishedEvents: MockPublishedEvent[] = [];
 
-  private active = false;
-
-  public constructor(config: EdgeChannelConfig) {
+  public constructor(
+    config: EdgeChannelConfig,
+    private readonly state: MockComponentState,
+  ) {
     this.config = resolveConfig(config);
     this.userId = resolveUserId(config);
   }
@@ -196,7 +203,8 @@ class MockEdgeEventPublisher {
   public async health(): Promise<EdgeChannelHealth> {
     return createHealthSnapshot({
       connected: true,
-      publisherActive: this.active,
+      consumerActive: this.state.consumerActive,
+      publisherActive: this.state.publisherActive,
       details: {
         publishedEvents: this.publishedEvents.length,
       },
@@ -214,7 +222,7 @@ class MockEdgeEventPublisher {
       throw new Error('mock publisher only accepts execution events');
     }
 
-    this.active = true;
+    this.state.publisherActive = true;
     this.publishedEvents.push({
       routingKey: buildRoutingKey(validatedEnvelope.messageType, {
         siteId: validatedEnvelope.payload.siteId ?? this.config.siteId,
@@ -238,8 +246,9 @@ export function createMockEdgeChannel(config: Partial<EdgeChannelConfig> = {}): 
     ...config,
   });
 
-  const publisher = new MockEdgeEventPublisher(resolvedConfig);
-  const consumer = new MockEdgeJobConsumer(resolvedConfig, publisher);
+  const state: MockComponentState = { consumerActive: false, publisherActive: false };
+  const publisher = new MockEdgeEventPublisher(resolvedConfig, state);
+  const consumer = new MockEdgeJobConsumer(resolvedConfig, publisher, state);
 
   return {
     consumer,

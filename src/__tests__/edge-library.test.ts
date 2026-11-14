@@ -24,6 +24,7 @@ import {
   EdgeEventPublisher,
   EdgeJobConsumer,
   EdgePublishError,
+  EdgeStaleDeliveryError,
   EdgeTopologyError,
   EdgeUnsupportedMessageTypeError,
   eventRoutingTypes,
@@ -126,8 +127,10 @@ type FakeDelivery = {
   content: Buffer;
 };
 
-class FakeConsumerChannel {
+class FakeConsumerChannel extends EventEmitter {
   public readonly calls: string[] = [];
+
+  public closed = false;
 
   public consumeCount = 0;
 
@@ -144,14 +147,18 @@ class FakeConsumerChannel {
 
   private consumeHandler?: (message: FakeDelivery | null) => void;
 
-  public constructor(public readonly log: string[] = []) {}
+  public constructor(public readonly log: string[] = []) {
+    super();
+  }
 
   public ack(message: { fields: { deliveryTag: number } }): void {
+    this.assertOpen();
     this.settlements.push(`ack ${message.fields.deliveryTag}`);
     this.log.push(`ack ${message.fields.deliveryTag}`);
   }
 
   public nack(message: { fields: { deliveryTag: number } }, _allUpTo?: boolean, requeue?: boolean): void {
+    this.assertOpen();
     this.nackCount += 1;
     this.lastNackDeliveryTag = message.fields.deliveryTag;
     const entry = `nack ${message.fields.deliveryTag} requeue=${String(requeue)}`;
@@ -198,17 +205,46 @@ class FakeConsumerChannel {
     // amqplib always sets properties; headers is empty unless the publisher or broker set one.
     this.consumeHandler({ properties: { headers: {} }, ...message });
   }
+
+  /** What amqplib does when the broker cancels the subscription: call the consumer with null. */
+  public emitCancel(): void {
+    assert.ok(this.consumeHandler, 'expected consume handler to be registered');
+    this.consumeHandler(null);
+  }
+
+  /** What amqplib does when the channel closes: later sends throw, and 'close' is emitted. */
+  public simulateClose(): void {
+    if (!this.closed) {
+      this.closed = true;
+      this.emit('close');
+    }
+  }
+
+  private assertOpen(): void {
+    if (this.closed) {
+      throw new Error('Channel closed');
+    }
+  }
 }
 
 class FakeConsumerConnectionManager {
   public readonly topologyChannels: FakeTopologyChannel[] = [];
 
-  private reconnectHandler?: () => Promise<void>;
+  /** Every consumer channel so far; the last is the open one. */
+  public readonly channels: FakeConsumerChannel[];
+
+  private readonly reconnectHandlers: Array<() => Promise<void>> = [];
+
+  private readonly reopenHandlers: Array<() => Promise<void>> = [];
+
+  private activeChannel?: FakeConsumerChannel;
 
   public constructor(
-    private readonly channel: FakeConsumerChannel,
+    public channel: FakeConsumerChannel,
     public readonly topology = new FakeBrokerTopology(),
-  ) {}
+  ) {
+    this.channels = [channel];
+  }
 
   public async openTopologyChannel(): Promise<FakeTopologyChannel> {
     const channel = new FakeTopologyChannel(this.topology);
@@ -217,29 +253,71 @@ class FakeConsumerConnectionManager {
   }
 
   public onReconnect(handler: () => Promise<void>): () => void {
-    this.reconnectHandler = handler;
-    return () => {
-      if (this.reconnectHandler === handler) {
-        this.reconnectHandler = undefined;
-      }
-    };
+    this.reconnectHandlers.push(handler);
+    return () => undefined;
+  }
+
+  public onChannelReopened(kind: string, handler: () => Promise<void>): () => void {
+    if (kind === 'consumer') {
+      this.reopenHandlers.push(handler);
+    }
+
+    return () => undefined;
+  }
+
+  public reportActive(kind: string, channel: FakeConsumerChannel): void {
+    if (kind === 'consumer') {
+      this.activeChannel = channel;
+    }
+  }
+
+  public reportInactive(kind: string): void {
+    if (kind === 'consumer') {
+      this.activeChannel = undefined;
+    }
   }
 
   public async getConsumerChannel(): Promise<FakeConsumerChannel> {
     return this.channel;
   }
 
+  // As the real connection manager does: active only on the open channel.
   public async health(): Promise<{ connected: boolean; consumerActive: boolean; publisherActive: boolean }> {
     return {
       connected: true,
-      consumerActive: true,
-      publisherActive: true,
+      consumerActive: this.activeChannel !== undefined && this.activeChannel === this.channel,
+      publisherActive: false,
     };
   }
 
-  public async triggerReconnect(): Promise<void> {
-    assert.ok(this.reconnectHandler, 'expected reconnect handler to be registered');
-    await this.reconnectHandler();
+  /** A reconnect: the old channel closes with its connection, then a new one is handed out. */
+  public async triggerReconnect(): Promise<FakeConsumerChannel> {
+    const next = this.replaceChannel();
+
+    for (const handler of this.reconnectHandlers) {
+      await handler();
+    }
+
+    return next;
+  }
+
+  /** The broker closes only the consumer channel, and a new one is opened on the same connection. */
+  public async triggerChannelReopen(): Promise<FakeConsumerChannel> {
+    const next = this.replaceChannel();
+
+    for (const handler of this.reopenHandlers) {
+      await handler();
+    }
+
+    return next;
+  }
+
+  private replaceChannel(): FakeConsumerChannel {
+    this.channel.simulateClose();
+    const next = new FakeConsumerChannel(this.channel.log);
+    this.channel = next;
+    this.channels.push(next);
+    return next;
   }
 }
 
@@ -291,8 +369,12 @@ class FakePublisherConnectionManager {
 
   private readonly reconnectHandlers: Array<() => Promise<void>> = [];
 
+  private readonly reopenHandlers: Array<() => Promise<void>> = [];
+
+  private activeChannel?: FakePublisherChannel;
+
   public constructor(
-    private readonly channel: FakePublisherChannel,
+    public channel: FakePublisherChannel,
     public readonly topology = new FakeBrokerTopology(),
   ) {}
 
@@ -301,8 +383,37 @@ class FakePublisherConnectionManager {
     return () => undefined;
   }
 
+  public onChannelReopened(kind: string, handler: () => Promise<void>): () => void {
+    if (kind === 'publisher') {
+      this.reopenHandlers.push(handler);
+    }
+
+    return () => undefined;
+  }
+
+  public reportActive(kind: string, channel: FakePublisherChannel): void {
+    if (kind === 'publisher') {
+      this.activeChannel = channel;
+    }
+  }
+
+  public reportInactive(kind: string): void {
+    if (kind === 'publisher') {
+      this.activeChannel = undefined;
+    }
+  }
+
   public async triggerReconnect(): Promise<void> {
     for (const handler of this.reconnectHandlers) {
+      await handler();
+    }
+  }
+
+  /** The broker closed the publisher channel, and `next` was opened on the same connection. */
+  public async triggerChannelReopen(next: FakePublisherChannel): Promise<void> {
+    this.channel = next;
+
+    for (const handler of this.reopenHandlers) {
       await handler();
     }
   }
@@ -320,8 +431,8 @@ class FakePublisherConnectionManager {
   public async health(): Promise<{ connected: boolean; consumerActive: boolean; publisherActive: boolean }> {
     return {
       connected: true,
-      consumerActive: true,
-      publisherActive: true,
+      consumerActive: false,
+      publisherActive: this.activeChannel !== undefined && this.activeChannel === this.channel,
     };
   }
 }
@@ -517,13 +628,20 @@ test('edge consumer re-initializes subscription after reconnect', async () => {
 
   await consumer.start();
   assert.equal(channel.consumeCount, 1);
+  assert.equal((await consumer.health()).consumerActive, true);
 
-  await connectionManager.triggerReconnect();
+  // The old channel closed with its connection, so the new subscription is on the new channel and
+  // there is nothing to cancel on the old one.
+  const next = await connectionManager.triggerReconnect();
 
-  assert.equal(channel.consumeCount, 2);
-  assert.deepEqual(channel.cancelledTags, ['ctag-1']);
+  assert.equal(channel.consumeCount, 1);
+  assert.equal(next.consumeCount, 1);
+  assert.deepEqual(channel.cancelledTags, []);
+  assert.equal((await consumer.health()).consumerActive, true);
 
   await consumer.stop();
+  assert.deepEqual(next.cancelledTags, ['ctag-1']);
+  assert.equal((await consumer.health()).consumerActive, false);
 });
 
 test('publisher waits for drain when broker applies backpressure', async () => {
@@ -908,20 +1026,23 @@ test('passive consumer checks its queue again after a reconnect, and stops clean
   const consumer = new EdgeJobConsumer(passiveConfig, connectionManager as never);
 
   await consumer.start();
-  await connectionManager.triggerReconnect();
+  const second = await connectionManager.triggerReconnect();
 
   assert.equal(connectionManager.topologyChannels.length, 2);
-  assert.equal(channel.consumeCount, 2);
-  assert.deepEqual(channel.cancelledTags, ['ctag-1']);
+  assert.equal(channel.consumeCount, 1);
+  assert.equal(second.consumeCount, 1);
 
   // The queue disappears while the node is disconnected: the reconnect handler does not throw
   // (which would leave the reconnect loop to swallow it), does not subscribe, and reports why.
   connectionManager.topology.missing.add(`queue ${nodeQueueName}`);
-  await connectionManager.triggerReconnect();
+  const third = await connectionManager.triggerReconnect();
 
   assert.equal(connectionManager.topologyChannels.length, 3);
-  assert.equal(channel.consumeCount, 2);
-  assert.equal(channel.calls.filter((call) => declaringCalls.test(call)).length, 0);
+  assert.equal(third.consumeCount, 0);
+  assert.equal(
+    connectionManager.channels.flatMap((each) => each.calls).filter((call) => declaringCalls.test(call)).length,
+    0,
+  );
 
   const health = await consumer.health();
   assert.equal(health.consumerActive, false);
@@ -1891,4 +2012,216 @@ test('a worker whose result publish is nacked does not ack the job: it is requeu
   assert.equal(failure.payload.code, 'DELIVERY_ATTEMPTS_EXHAUSTED');
   assert.deepEqual(failure.payload.details?.handlerError, { code: 'HANDLER_ERROR', name: 'EdgePublishError' });
   await consumer.stop();
+});
+
+// --- Reconnects, channel closes and health -------------------------------------------------------
+
+function gate(): { opened: Promise<void>; open: () => void } {
+  let open = () => undefined as void;
+  const opened = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { opened, open };
+}
+
+const turn = () => new Promise((resolve) => setImmediate(resolve));
+
+const reconnectConfig = { amqpUrl: 'amqp://test.local', siteId: 'site-a', nodeId: 'node-1', runtimeConsumerVersion: '0.1.0' };
+
+test('after a reconnect a delivery from the old channel cannot be acked, and its tag cannot settle the new one', async () => {
+  const channel = new FakeConsumerChannel();
+  const connectionManager = new FakeConsumerConnectionManager(channel);
+  const consumer = new EdgeJobConsumer(reconnectConfig, connectionManager as never);
+  const held: Array<{ delivery: JobDeliveryContext; release: ReturnType<typeof gate> }> = [];
+  const outcomes: string[] = [];
+
+  consumer.onJob(async (_job, delivery) => {
+    const release = gate();
+    held.push({ delivery, release });
+    await release.opened;
+    try {
+      await consumer.ack(delivery);
+      outcomes.push(`acked ${delivery.subscriptionId}:${delivery.deliveryTag}`);
+    } catch (error) {
+      outcomes.push(error instanceof EdgeStaleDeliveryError ? `stale ${error.deliveryTag}` : `error ${String(error)}`);
+    }
+  });
+  await consumer.start();
+
+  channel.emitMessage(jobDelivery(1, false));
+  await turn();
+  assert.equal((await consumer.health()).details?.pendingDeliveries, 1);
+
+  // The connection drops with job 1 in flight. The broker delivers it again on the new channel,
+  // where delivery tags start over at 1.
+  const next = await connectionManager.triggerReconnect();
+  const afterReconnect = await consumer.health();
+  assert.equal(afterReconnect.consumerActive, true);
+  assert.equal(afterReconnect.details?.pendingDeliveries, 0);
+  assert.equal(afterReconnect.details?.discardedDeliveries, 1);
+
+  next.emitMessage(jobDelivery(1, true));
+  await turn();
+  assert.equal(held.length, 2);
+  assert.equal(held[0]!.delivery.deliveryTag, held[1]!.delivery.deliveryTag);
+  assert.notEqual(held[0]!.delivery.subscriptionId, held[1]!.delivery.subscriptionId);
+
+  // The first handler finishes: its ack is refused and sends nothing, so it can neither close the
+  // new channel with an unknown tag nor ack the redelivery that now holds tag 1.
+  held[0]!.release.open();
+  await turn();
+  assert.deepEqual(outcomes, ['stale 1']);
+  assert.deepEqual(channel.settlements, []);
+  assert.deepEqual(next.settlements, []);
+
+  held[1]!.release.open();
+  await turn();
+  assert.deepEqual(outcomes, ['stale 1', `acked ${held[1]!.delivery.subscriptionId}:1`]);
+  assert.deepEqual(next.settlements, ['ack 1']);
+  assert.equal((await consumer.health()).details?.pendingDeliveries, 0);
+
+  await consumer.stop();
+});
+
+test('a consumer channel the broker closes is replaced: the consumer resubscribes, and a handler that throws late sends nothing', async () => {
+  const channel = new FakeConsumerChannel();
+  const connectionManager = new FakeConsumerConnectionManager(channel);
+  const consumer = new EdgeJobConsumer(reconnectConfig, connectionManager as never);
+  const release = gate();
+  let delivered: JobDeliveryContext | undefined;
+
+  consumer.onJob(async (_job, delivery) => {
+    delivered = delivery;
+    await release.opened;
+    throw new Error('handler bug');
+  });
+  await consumer.start();
+  channel.emitMessage(jobDelivery(1, false));
+  await turn();
+
+  // The broker closes only the consumer channel. Until a new one is open the consumer is not active,
+  // and the delivery it held cannot be settled.
+  channel.simulateClose();
+  const closed = await consumer.health();
+  assert.equal(closed.connected, true);
+  assert.equal(closed.consumerActive, false);
+  assert.equal(closed.details?.discardedDeliveries, 1);
+  await assert.rejects(() => consumer.ack(delivered!), (error: unknown) => error instanceof EdgeStaleDeliveryError && error.deliveryTag === 1);
+
+  const next = await connectionManager.triggerChannelReopen();
+  assert.equal(next.consumeCount, 1);
+  assert.equal((await consumer.health()).consumerActive, true);
+
+  // The handler throws after its channel closed: no requeue on either channel, no unhandled rejection.
+  release.open();
+  await turn();
+  await turn();
+  assert.deepEqual(channel.settlements, []);
+  assert.deepEqual(next.settlements, []);
+
+  await consumer.stop();
+});
+
+test('a context without subscriptionId names a delivery of the current subscription', async () => {
+  const channel = new FakeConsumerChannel();
+  const connectionManager = new FakeConsumerConnectionManager(channel);
+  const consumer = new EdgeJobConsumer(reconnectConfig, connectionManager as never);
+  consumer.onJob(async () => undefined);
+  await consumer.start();
+
+  const next = await connectionManager.triggerReconnect();
+  next.emitMessage(jobDelivery(1, true));
+  await turn();
+
+  await consumer.ack({ deliveryTag: 1 });
+  assert.deepEqual(next.settlements, ['ack 1']);
+  await assert.rejects(() => consumer.ack({ deliveryTag: 1 }), /delivery 1 is not pending/);
+  await consumer.stop();
+});
+
+test('a subscription the broker cancels is restored, or in passive mode stopped when its queue is gone', async () => {
+  const channel = new FakeConsumerChannel();
+  const connectionManager = new FakeConsumerConnectionManager(channel);
+  const consumer = new EdgeJobConsumer({ ...passiveConfig, runtimeConsumerVersion: '0.1.0' }, connectionManager as never);
+  const contexts: JobDeliveryContext[] = [];
+  consumer.onJob(async (_job, delivery) => {
+    contexts.push(delivery);
+    await new Promise(() => undefined);
+  });
+  await consumer.start();
+  channel.emitMessage(jobDelivery(1, false));
+  await turn();
+
+  // The broker cancels the subscription while job 1 is in flight. Its queue is still there, so
+  // the consumer checks it again and subscribes on the same channel.
+  channel.emitCancel();
+  await turn();
+  await turn();
+  assert.equal(contexts.length, 1);
+  assert.equal(channel.consumeCount, 2);
+  assert.equal(connectionManager.topologyChannels.length, 2);
+  let health = await consumer.health();
+  assert.equal(health.consumerActive, true);
+  assert.equal(health.details?.brokerCancellations, 1);
+  assert.equal(health.details?.discardedDeliveries, 1);
+  await assert.rejects(() => consumer.ack(contexts[0]!), EdgeStaleDeliveryError);
+  assert.deepEqual(channel.settlements, []);
+
+  // Cancelled again, now because the queue was deleted: the consumer stops and says why.
+  connectionManager.topology.missing.add(`queue ${nodeQueueName}`);
+  channel.emitCancel();
+  await turn();
+  await turn();
+  assert.equal(channel.consumeCount, 2);
+  health = await consumer.health();
+  assert.equal(health.consumerActive, false);
+  assert.equal(health.details?.brokerCancellations, 2);
+  assert.match(String(health.details?.topologyError), /does not exist/);
+
+  // It stays stopped across a reconnect.
+  const next = await connectionManager.triggerReconnect();
+  assert.equal(next.consumeCount, 0);
+});
+
+test('publisherActive follows the last publish on the open publisher channel', async () => {
+  const channel = new FakePublisherChannel(true);
+  const connectionManager = new FakePublisherConnectionManager(channel);
+  const publisher = new EdgeEventPublisher(passiveConfig, connectionManager as never);
+
+  assert.equal((await publisher.health()).publisherActive, false);
+  await publisher.publishAck(createAckMessage());
+  assert.equal((await publisher.health()).publisherActive, true);
+
+  channel.confirm = 'nack';
+  await assert.rejects(() => publisher.publishAck(createAckMessage()), EdgePublishError);
+  assert.equal((await publisher.health()).publisherActive, false);
+
+  channel.confirm = 'ack';
+  await publisher.publishAck(createAckMessage());
+  assert.equal((await publisher.health()).publisherActive, true);
+  assert.equal(connectionManager.topologyChannels.length, 1);
+
+  // The broker closed the publisher channel and a new one was opened: not active until a publish
+  // on it is confirmed, and the events exchange is checked again first.
+  const next = new FakePublisherChannel(true);
+  await connectionManager.triggerChannelReopen(next);
+  assert.equal((await publisher.health()).publisherActive, false);
+  await publisher.publishAck(createAckMessage());
+  assert.equal((await publisher.health()).publisherActive, true);
+  assert.equal(connectionManager.topologyChannels.length, 2);
+  assert.equal(next.publishCalls, 1);
+});
+
+test('the mock channel reports both components in each health snapshot', async () => {
+  const mock = createMockEdgeChannel({ amqpUrl: 'amqp://node-1:secret@broker.example.com', siteId: 'site-a', nodeId: 'node-1' });
+
+  await mock.consumer.start();
+  assert.equal((await mock.publisher.health()).consumerActive, true);
+  assert.equal((await mock.consumer.health()).publisherActive, false);
+
+  await mock.publisher.publishAck(createAckMessage());
+  assert.equal((await mock.consumer.health()).publisherActive, true);
+
+  await mock.close();
+  assert.equal((await mock.publisher.health()).consumerActive, false);
 });

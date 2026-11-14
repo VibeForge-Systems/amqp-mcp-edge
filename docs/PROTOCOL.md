@@ -450,6 +450,16 @@ dead-lettered, so one bad job cannot hold a node's queue.
   handler should check `deliveryAttempt` itself.
 - **A new attempt starts over.** The control plane retries a job as a new message with a new
   `attemptId`, whose first delivery is attempt 1 again.
+- **A job in flight when the node's channel closes is delivered again.** When the connection
+  drops or the broker closes the node's consumer channel, the broker returns every job left
+  unacked on that channel to the queue and delivers it again, marked redelivered, so it is at
+  least attempt 2. The handler run that still holds it cannot settle it: its delivery tag belonged
+  to the closed channel, and on the new one the same tag may name another job. The consumer
+  refuses such an `ack` or `nack` with an `EdgeStaleDeliveryError` and sends nothing. A job whose
+  first run had already published its result therefore runs again, so a control plane
+  deduplicates outcomes by `jobId` and `attemptId` (see
+  [Publishing Guarantees](#publishing-guarantees)). The same holds when the broker cancels the
+  node's subscription, for example because its queue was deleted.
 
 The count is kept by the consumer, in memory, because the broker does not keep it: RabbitMQ 4.4
 sets no `x-delivery-count` when a job is rejected with `requeue: true`, on classic or quorum
@@ -572,10 +582,12 @@ Jobs a node rejects go to the dead-letter queue, which the platform declares; se
 [Dead-Letter Queue](#dead-letter-queue).
 
 A node in passive mode checks, with passive declares, that its queue and `mcp.edge.events` exist,
-once at startup and again once after each reconnect. If either is missing, startup fails with an
-`EdgeTopologyError` naming it, and nothing is created. A consumer whose queue has gone after a
-reconnect stops, and its `health()` reports `consumerActive: false` with the reason in
-`details.topologyError`. A node does not check `mcp.edge.jobs` or `mcp.edge.dlx`: it holds no
+once at startup and again once after each reconnect. The consumer also checks its queue again
+before it subscribes on a channel reopened after the broker closed one, or after the broker
+cancelled its subscription; the publisher checks the exchange again after its channel is
+reopened. If either is missing at startup, startup fails with an `EdgeTopologyError` naming it,
+and nothing is created. A consumer that finds its queue gone later stops, and its `health()`
+reports `consumerActive: false` with the reason in `details.topologyError`. A node does not check `mcp.edge.jobs` or `mcp.edge.dlx`: it holds no
 permission on them, and RabbitMQ 4 refuses a passive declare from a user with no permission on the
 name.
 

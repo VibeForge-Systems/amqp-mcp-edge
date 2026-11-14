@@ -62,8 +62,6 @@ export class EdgeEventPublisher implements EdgeEventPublisher {
 
   private readonly connectionManager;
 
-  private publisherActive = false;
-
   private readonly userId: string;
 
   private topologyVerification?: Promise<void>;
@@ -80,6 +78,11 @@ export class EdgeEventPublisher implements EdgeEventPublisher {
     this.connectionManager = connectionManager;
     connectionManager.onReconnect(async () => {
       // Check the events exchange again, once, on the new connection.
+      this.topologyVerification = undefined;
+    });
+    connectionManager.onChannelReopened('publisher', async () => {
+      // The broker closes the channel of a publish to an exchange that does not exist, so check
+      // it again before the next publish: a missing exchange then fails with an EdgeTopologyError.
       this.topologyVerification = undefined;
     });
   }
@@ -130,13 +133,19 @@ export class EdgeEventPublisher implements EdgeEventPublisher {
     await this.publish(message);
   }
 
+  /**
+   * `publisherActive` is true while the most recent publish to finish was confirmed and its
+   * channel is still open; it is false before the first publish, after a failed one, and once that
+   * channel closes, until a publish is confirmed again.
+   */
   public async health(): Promise<EdgeChannelHealth> {
     const connectionHealth = await this.connectionManager.health();
 
     return createHealthSnapshot({
       connected: connectionHealth.connected,
-      publisherActive: this.publisherActive,
+      publisherActive: connectionHealth.publisherActive,
       consumerActive: connectionHealth.consumerActive,
+      ...(connectionHealth.details ? { details: { ...connectionHealth.details } } : {}),
     });
   }
 
@@ -174,8 +183,14 @@ export class EdgeEventPublisher implements EdgeEventPublisher {
       userId: this.userId,
     };
 
-    await this.publishConfirmed(channel, routingKey, content, publishOptions, validatedMessage);
-    this.publisherActive = true;
+    try {
+      await this.publishConfirmed(channel, routingKey, content, publishOptions, validatedMessage);
+    } catch (error) {
+      this.connectionManager.reportInactive('publisher');
+      throw error;
+    }
+
+    this.connectionManager.reportActive('publisher', channel);
   }
 
   // Resolves once the broker acks the publish; rejects with an EdgePublishError if it nacks it, if
