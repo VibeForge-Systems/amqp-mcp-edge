@@ -504,11 +504,8 @@ A node in a group (`nodeGroup`) also binds `edge.job.<siteId>.<nodeGroup>.*.*` a
 queue name and binding keys from a node's config, so a control plane written in TypeScript can
 reuse them.
 
-Dead-lettering: a node rejects a job it cannot parse or validate with `requeue: false`, and the
-broker moves it to `mcp.edge.dlx` with its original routing key; the node needs no permission for
-this. Without a queue bound to `mcp.edge.dlx`, rejected jobs are dropped. Jobs addressed to `any`
-keep `any` in their routing key, so bind the dead-letter queue with `#`, or set
-`x-dead-letter-routing-key` on each node queue if dead letters must be told apart by node.
+Jobs a node rejects go to the dead-letter queue, which the platform declares; see
+[Dead-Letter Queue](#dead-letter-queue).
 
 A node in passive mode checks, with passive declares, that its queue and `mcp.edge.events` exist,
 once at startup and again once after each reconnect. If either is missing, startup fails with an
@@ -521,6 +518,41 @@ name.
 The default `topologyMode: 'declare'` declares all of the above for the node itself (except the
 dead-letter queue and the node user), which needs the configure permission. It is meant for local
 development against a broker you own.
+
+### Dead-Letter Queue
+
+**The platform owns the dead-letter queue.** The control plane, or the operator when
+self-hosting, declares it and binds it to `mcp.edge.dlx` before any node starts, and monitors its
+depth. The library never declares or binds it, in either topology mode: declaring a queue needs the
+configure permission, which a node does not have. In declare mode, which is for local development,
+the library declares `mcp.edge.dlx` and points the node queue at it, but binds no queue to it, so
+rejected jobs are dropped unless you bind one yourself.
+
+What a self-hosting operator declares:
+
+| Entity | Declaration |
+|:---|:---|
+| exchange `mcp.edge.dlx` | topic, durable |
+| a queue such as `mcp.edge.dlq` | durable (quorum recommended), bound to `mcp.edge.dlx` with `#` |
+| on every node queue | the argument `x-dead-letter-exchange: mcp.edge.dlx` |
+
+A node rejects a job with `requeue: false`, and the broker moves it to `mcp.edge.dlx`; the node
+needs no permission on the exchange or the queue for this. A job is dead-lettered when it:
+
+- is larger than the node's `maxMessageSizeBytes`;
+- is not JSON, fails envelope validation, or is not an `execution.job`;
+- fails the compatibility check (`compatibility.minConsumerVersion`);
+- is rejected by the node's handler with `nack(delivery, { requeue: false })`.
+
+The broker keeps the job's routing key and adds an `x-death` header naming the node queue, the
+reason (`rejected`) and the count. Jobs addressed to `any` keep `any` in their routing key, so bind
+the dead-letter queue with `#`, or set `x-dead-letter-routing-key` on each node queue if dead
+letters must be told apart by node. Without a queue bound to `mcp.edge.dlx`, the broker drops
+dead-lettered jobs silently, which is why the platform declares it before any node starts.
+
+Bound the queue's growth with a policy (for example `max-length` or `message-ttl`), and alert on
+its depth: a job in it was never run to completion, and for the first three cases above the node
+published no event about it.
 
 ## Least-Privilege Permissions
 

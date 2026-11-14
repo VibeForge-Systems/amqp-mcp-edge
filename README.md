@@ -157,7 +157,7 @@ await channel.consumer.start();
 | `nodeGroup` | — | Group whose jobs the node also takes |
 | `jobsExchange` | `mcp.edge.jobs` | Exchange jobs arrive on |
 | `eventsExchange` | `mcp.edge.events` | Exchange events are published to |
-| `deadLetterExchange` | `mcp.edge.dlx` | The consumer queue's `x-dead-letter-exchange`, in declare mode |
+| `deadLetterExchange` | `mcp.edge.dlx` | The consumer queue's `x-dead-letter-exchange`, in declare mode. The library binds no queue to it; the platform declares the dead-letter queue |
 | `consumerQueueName` | `mcp.edge.consumer.<siteId>.<nodeId>` | The queue the node consumes |
 | `queueNamingStrategy` | built in | Computes the queue name when `consumerQueueName` is not set |
 | `consumerQueueOptions` | `{ durable: true }` | Queue declaration options, in declare mode; ignored in passive mode |
@@ -201,6 +201,9 @@ const channel = await createEdgeChannel({
   broker refuses an event whose `user_id` is not the authenticated user. Consumers of
   `mcp.edge.events` must reject events that lack it
   ([Node identity](docs/PROTOCOL.md#node-identity)).
+- **The platform declares the dead-letter queue.** It binds a queue to `mcp.edge.dlx` before any
+  node starts and watches its depth; the library never declares it, in either mode. Without it,
+  rejected jobs are dropped ([Dead-letter queue](docs/PROTOCOL.md#dead-letter-queue)).
 - **`amqps://`** for any broker not on the same host or a trusted private network.
 
 `'declare'` remains the default in 0.x, for backward compatibility and local development against
@@ -349,10 +352,6 @@ runtime still has gaps that matter for production use. They will be closed befor
 - **A throwing job handler requeues indefinitely.** There is no retry limit or poison-message
   handling yet; handle errors inside your handler and `nack` with `requeue: false` for permanent
   failures.
-- **Declare mode does not bind the dead-letter exchange.** It declares `mcp.edge.dlx` and sets it
-  as the queue's dead-letter exchange, but jobs rejected with `requeue: false` are dropped unless
-  you bind a queue to it. In passive mode the control plane declares that queue
-  ([Broker topology](docs/PROTOCOL.md#broker-topology)).
 - **RabbitMQ 4.x refuses transient non-exclusive queues.** The default consumer queue is durable
   and unaffected. If you pass `consumerQueueOptions` with `durable: false`, also set
   `exclusive: true`; otherwise the broker closes the connection on declare.

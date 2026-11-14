@@ -108,6 +108,10 @@ follows [Semantic Versioning](https://semver.org/). Version 0.1.0 has not been p
 - added reconnect and channel re-initialization workflow in connection lifecycle
 - runtime compatibility checks are now enforced by consumer and publisher paths
 - publisher now waits for channel drain when AMQP backpressure is signaled
+- **Contract:** the platform, not the library, declares the dead-letter queue and binds it to
+  `mcp.edge.dlx`, in either topology mode; the library never declares a queue on it.
+  `docs/PROTOCOL.md` documents what an operator declares, which jobs are dead-lettered, and why
+  the queue must exist before any node starts
 
 ## [0.1.0] - unreleased
 
