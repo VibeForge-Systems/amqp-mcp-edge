@@ -487,10 +487,19 @@ src/
 ## Release
 
 - [CHANGELOG.md](CHANGELOG.md) — release history.
-- [docs/RELEASE_POLICY.md](docs/RELEASE_POLICY.md) — versioning rules and release gates.
+- [docs/RELEASE_POLICY.md](docs/RELEASE_POLICY.md) — versioning rules, release gates, and how a
+  release is cut.
+
+A pushed `vX.Y.Z` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml):
+- it tests, builds and packs the package;
+- it publishes a GitHub Release with the tarball and its SHA-256;
+- it publishes that same tarball to npm with provenance, but only once npm publishing is turned on.
+
+Before tagging, run the same checks locally:
 
 ```bash
 npm run release:check
+node scripts/release-preflight.mjs vX.Y.Z
 ```
 
 ---

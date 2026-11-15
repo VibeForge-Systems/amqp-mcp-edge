@@ -62,3 +62,7 @@ jobs:
           # Fail, rather than skip, the least-privilege tests if the management API is unreachable.
           AMQP_INTEGRATION_REQUIRE_MANAGEMENT: '1'
       - run: npm pack --dry-run
+      # What a tag of this version would check, except the release date: the CHANGELOG must already
+      # have a section for package.json's version.
+      - name: Release preflight
+        run: node scripts/release-preflight.mjs "v$(node -p "require('./package.json').version")" --allow-undated

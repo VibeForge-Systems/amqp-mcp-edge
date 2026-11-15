@@ -16,6 +16,12 @@ follows [Semantic Versioning](https://semver.org/). Version 0.1.0 has not been p
 - in-memory mock edge channel for tests and contract walkthroughs
 - RabbitMQ-backed integration test workflow and live end-to-end example
 - initial release policy and first-publish guidance
+- release workflow (`.github/workflows/release.yml`). A `vX.Y.Z` tag tests, builds and packs the
+  package, creates a GitHub Release with the tarball and its SHA-256, and publishes that tarball
+  to npm with provenance once the `NPM_PUBLISH` repository variable turns publishing on (with an
+  `NPM_TOKEN` secret, or npm trusted publishing). `scripts/release-preflight.mjs` checks the tag
+  against `package.json` and `CHANGELOG.md`, and CI runs it on every pull request.
+  `docs/RELEASE_POLICY.md` describes the flow and how to turn npm publishing on
 - `topologyMode` config option. `'passive'` never declares an exchange or queue and never binds:
   the consumer checks its queue and the publisher checks the events exchange with passive
   declares, once at startup and once after each reconnect, so a node user needs no configure
