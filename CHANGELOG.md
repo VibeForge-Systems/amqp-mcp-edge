@@ -58,6 +58,29 @@ follows [Semantic Versioning](https://semver.org/). Version 0.1.0 has not been p
   `EdgeConventionError` listing every problem
 - `edgeFailureCodes`, the standard `execution.failure` codes, and the reserved `package.*` and
   `node.*` task names
+- `maxDeliveryAttempts` config option (default 2) and `deliveryAttempt` on each delivery's
+  context. A job whose handler throws is requeued until its last attempt; on that attempt the
+  consumer publishes `execution.failure` with the new code `DELIVERY_ATTEMPTS_EXHAUSTED` and
+  `retryable: false`, then rejects it without requeue, which dead-letters it. The event's
+  `details.handlerError` carries the code `HANDLER_ERROR` and the error's class name, not the
+  handler's message; the opt-in `describeHandlerError` option adds a description, cut to
+  `maxHandlerErrorDescriptionLength` (1000) characters. The `producer` config option names the
+  producer of that event. `EdgeJobConsumer` takes the publisher it reports through as a third
+  constructor argument, which `createEdgeChannel` passes. The mock channel does the same
+- publisher confirms: the publisher channel is a confirm channel, and every publish resolves only
+  once the broker confirms the event. It rejects with the new `EdgePublishError` (`reason`
+  `nacked`, `channel-closed` or `timeout`, plus the event's `messageType` and `messageId`) when the
+  broker nacks it, the channel closes first, or no confirm arrives within the new
+  `confirmTimeoutMs` option (default 10000). A worker that acks a job after awaiting its result no
+  longer acks a job whose result the broker lost. `docs/PROTOCOL.md` documents the guarantees
+- `EdgeStaleDeliveryError` and `subscriptionId` on each delivery's context. A job context names
+  the subscription it arrived on, and `ack` or `nack` of a delivery whose subscription has ended
+  (its channel closed, the broker cancelled it, or the consumer stopped) rejects with this error
+  and sends nothing, instead of sending a stale delivery tag on the new channel
+- `EdgeChannelConnectionManager.onChannelReopened`, `reportActive` and `reportInactive`, and the
+  `EdgeChannelKind` type. Health `details` gain `consumerChannelReopens`,
+  `publisherChannelReopens` and `lastChannelError` (both components) and `discardedDeliveries`,
+  `brokerCancellations` and `lastResubscribeError` (the consumer)
 - `checkEventIdentity`, which applies the node-identity rules to a delivered event for a control
   plane, and `parseEventRoutingKey`, `buildNodeKey`, `sanitizeRoutingSegment` and
   `eventRoutingTypes`
@@ -114,6 +137,31 @@ follows [Semantic Versioning](https://semver.org/). Version 0.1.0 has not been p
 - added reconnect and channel re-initialization workflow in connection lifecycle
 - runtime compatibility checks are now enforced by consumer and publisher paths
 - publisher now waits for channel drain when AMQP backpressure is signaled
+- a job handler that throws no longer has its job requeued forever, which starved every job
+  queued behind it; see the `maxDeliveryAttempts` entry above and "Delivery Attempts" in
+  `docs/PROTOCOL.md`, which also recommends quorum node queues with `x-delivery-limit` against a
+  job that crashes the node process
+- after a reconnect, a delivery received on the old channel could not be settled safely: the
+  consumer sent its delivery tag on the new channel, where the broker closed the channel for an
+  unknown tag or, if the tag had been reused, settled the delivery that now held it. Pending deliveries now end with
+  their subscription, and settling one rejects with `EdgeStaleDeliveryError`
+- a channel the broker closed (for example with `PRECONDITION_FAILED`) had no `error` listener, so
+  amqplib closed the whole connection and both components reconnected. The channel is now
+  reopened on the same connection: the consumer subscribes again, and the publisher checks the
+  events exchange again in passive mode. A channel that keeps closing is reopened after a growing
+  delay. With `reconnectEnabled: false` it is reopened only when next used
+- a subscription the broker cancelled, for example because its queue was deleted, was ignored,
+  and `health()` kept reporting the consumer active. The consumer now subscribes again, or in
+  passive mode stops when its queue is gone
+- `health()` reported `publisherActive` from the consumer and `consumerActive` from the publisher
+  as always false, and `consumerActive` as true while a connection was down. Both flags are now
+  tracked by the connection manager against the open channels and reported by both components;
+  the mock channel does the same
+- `consumer.stop()` cancels on the channel it subscribed on, without connecting
+- **Contract:** the platform, not the library, declares the dead-letter queue and binds it to
+  `mcp.edge.dlx`, in either topology mode; the library never declares a queue on it.
+  `docs/PROTOCOL.md` documents what an operator declares, which jobs are dead-lettered, and why
+  the queue must exist before any node starts
 
 ## [0.1.0] - unreleased
 

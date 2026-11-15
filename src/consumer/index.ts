@@ -1,2 +1,2 @@
-export type { JobDeliveryContext, EdgeJobHandler } from './edge-job-consumer.js';
-export { EdgeJobConsumer } from './edge-job-consumer.js';
+export type { EdgeJobConsumerOptions, JobDeliveryContext, EdgeJobHandler } from './edge-job-consumer.js';
+export { EdgeJobConsumer, EdgeStaleDeliveryError, maxHandlerErrorDescriptionLength } from './edge-job-consumer.js';

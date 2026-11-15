@@ -71,6 +71,30 @@ export interface EdgeChannelConfig {
   consumerQueueOptions?: Options.AssertQueue;
   consumerTag?: string;
   prefetchCount?: number;
+  /**
+   * How many times a job may be delivered to a handler that throws, counting the first delivery.
+   * When the handler throws on the last attempt, the consumer publishes `execution.failure` with
+   * code `DELIVERY_ATTEMPTS_EXHAUSTED` and `retryable: false`, then rejects the job without
+   * requeue, which dead-letters it. Defaults to 2: a throwing job is requeued once.
+   */
+  maxDeliveryAttempts?: number;
+  /**
+   * Opt-in: describes a handler's error for the failure event above. By default that event carries
+   * only the code `HANDLER_ERROR` and the error's class name, never the error's message, which
+   * often holds connection strings, signed URLs, paths or other secrets. When set, its result is
+   * sent as `details.handlerError.description`, cut to 1000 characters; return `undefined` to send
+   * none. Keep credentials out of what it returns.
+   */
+  describeHandlerError?: (error: unknown) => string | undefined;
+  /**
+   * The `producer` of events the library publishes on its own, such as the failure above.
+   * Defaults to this library's name and version.
+   */
+  producer?: {
+    service: string;
+    version: string;
+    instanceId?: string;
+  };
   runtimeConsumerVersion?: string;
   runtimeProducerVersion?: string;
   connectionName?: string;
@@ -79,6 +103,12 @@ export interface EdgeChannelConfig {
   reconnectDelayMs?: number;
   reconnectMaxDelayMs?: number;
   backpressureTimeoutMs?: number;
+  /**
+   * How long a publish waits for the broker to confirm the event before it rejects. Defaults to
+   * 10000. The publisher channel is a confirm channel, so every publish resolves only once the
+   * broker has taken responsibility for the event.
+   */
+  confirmTimeoutMs?: number;
   queueNamingStrategy?: QueueNamingStrategy;
   routingKeyStrategy?: RoutingKeyStrategy;
 }
@@ -89,12 +119,17 @@ export interface ResolvedEdgeChannelConfig extends EdgeChannelConfig {
   eventsExchange: string;
   deadLetterExchange: string;
   prefetchCount: number;
+  maxDeliveryAttempts: number;
   maxMessageSizeBytes: number;
   reconnectEnabled: boolean;
   reconnectDelayMs: number;
   reconnectMaxDelayMs: number;
   backpressureTimeoutMs: number;
+  confirmTimeoutMs: number;
 }
+
+/** The default `maxDeliveryAttempts`: a job whose handler throws is requeued once, then dead-lettered. */
+export const defaultMaxDeliveryAttempts = 2;
 
 export const defaultExchangeConfig: ExchangeConfig = {
   jobsExchange: 'mcp.edge.jobs',
@@ -282,11 +317,13 @@ export function resolveConfig(config: EdgeChannelConfig): ResolvedEdgeChannelCon
     eventsExchange: config.eventsExchange ?? defaultExchangeConfig.eventsExchange,
     deadLetterExchange: config.deadLetterExchange ?? defaultExchangeConfig.deadLetterExchange,
     prefetchCount: config.prefetchCount ?? 1,
+    maxDeliveryAttempts: config.maxDeliveryAttempts ?? defaultMaxDeliveryAttempts,
     maxMessageSizeBytes: config.maxMessageSizeBytes ?? 1024 * 1024,
     reconnectEnabled: config.reconnectEnabled ?? true,
     reconnectDelayMs: config.reconnectDelayMs ?? 1000,
     reconnectMaxDelayMs: config.reconnectMaxDelayMs ?? 30_000,
     backpressureTimeoutMs: config.backpressureTimeoutMs ?? 5000,
+    confirmTimeoutMs: config.confirmTimeoutMs ?? 10_000,
   };
 }
 
@@ -382,6 +419,29 @@ export function validateConfig(config: EdgeChannelConfig): string[] {
   }
 
   if (
+    config.maxDeliveryAttempts !== undefined &&
+    (!Number.isSafeInteger(config.maxDeliveryAttempts) || config.maxDeliveryAttempts <= 0)
+  ) {
+    errors.push('maxDeliveryAttempts must be a positive integer');
+  }
+
+  if (config.describeHandlerError !== undefined && typeof config.describeHandlerError !== 'function') {
+    errors.push('describeHandlerError must be a function');
+  }
+
+  if (config.producer !== undefined) {
+    const { service, version, instanceId } = config.producer;
+
+    if (typeof service !== 'string' || service.length === 0 || typeof version !== 'string' || version.length === 0) {
+      errors.push('producer.service and producer.version must be non-empty strings');
+    }
+
+    if (instanceId !== undefined && (typeof instanceId !== 'string' || instanceId.length === 0)) {
+      errors.push('producer.instanceId must be a non-empty string when set');
+    }
+  }
+
+  if (
     config.maxMessageSizeBytes !== undefined &&
     (!Number.isInteger(config.maxMessageSizeBytes) || config.maxMessageSizeBytes <= 0)
   ) {
@@ -412,6 +472,10 @@ export function validateConfig(config: EdgeChannelConfig): string[] {
     (!Number.isInteger(config.backpressureTimeoutMs) || config.backpressureTimeoutMs <= 0)
   ) {
     errors.push('backpressureTimeoutMs must be a positive integer');
+  }
+
+  if (config.confirmTimeoutMs !== undefined && (!Number.isInteger(config.confirmTimeoutMs) || config.confirmTimeoutMs <= 0)) {
+    errors.push('confirmTimeoutMs must be a positive integer');
   }
 
   return errors;

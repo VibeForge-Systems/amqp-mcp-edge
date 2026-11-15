@@ -399,6 +399,7 @@ may use other codes as well.
 | `TIMEOUT` | The job ran past `timeoutMs` and was stopped | see [Tool jobs](#tool-jobs) |
 | `INPUT_REQUIRED` | The tool answered `input_required` | `false` |
 | `HANDLER_ERROR` | Anything else that stopped the handler | the node's judgment |
+| `DELIVERY_ATTEMPTS_EXHAUSTED` | Published by the library: the handler threw on the last of `maxDeliveryAttempts` deliveries, and the job was dead-lettered; see [Delivery Attempts](#delivery-attempts) | `false` |
 | `PACKAGE_DOWNLOAD_FAILED` | The archive could not be downloaded | `true` |
 | `PACKAGE_URL_EXPIRED` | The signed URL had expired, or the store refused it | `true`, with a new URL |
 | `PACKAGE_HASH_UNSUPPORTED` | The node does not implement the dist hash's algorithm tag | `false` |
@@ -416,6 +417,57 @@ that receives a reserved task name it does not implement fails the job with
 changing its configuration) will be defined as `node.*` tasks, so they reuse the job's
 acknowledgement, timeout, idempotency and dead-lettering instead of needing a message type and
 routing of their own.
+
+## Delivery Attempts
+
+A job whose handler throws is redelivered a bounded number of times, then reported and
+dead-lettered, so one bad job cannot hold a node's queue.
+
+- **`deliveryAttempt`.** Each delivery reaches the handler with `deliveryAttempt`, counted from 1:
+  the first delivery, plus every requeue this consumer made of the same job attempt (the same
+  `messageId` and `attemptId`), plus the returns the broker counted in `x-delivery-count`. A job
+  the broker marks redelivered is at least attempt 2, even when this process never saw it before.
+- **`maxDeliveryAttempts`** (default 2). When the handler throws and `deliveryAttempt` is below
+  it, the consumer rejects the job with `requeue: true`. When the handler throws on attempt
+  `maxDeliveryAttempts`, the consumer publishes an `execution.failure` and then rejects the job
+  without requeue, which dead-letters it. The failure has code `DELIVERY_ATTEMPTS_EXHAUSTED`,
+  `retryable: false`, the job's `jobId` and `attemptId`, the node's `siteId` and `nodeId`, and
+  `details: { deliveryAttempt, maxDeliveryAttempts, handlerError }`.
+- **`handlerError` carries a code, not the handler's message.** It is
+  `{ code: 'HANDLER_ERROR', name?, description? }`. `name` is the error's class name, such as
+  `TypeError`, sent only when it is a plain identifier of at most 64 characters. The error's
+  message is never sent by default, because error messages often carry connection strings,
+  signed URLs, file paths or other secrets, and a node may run on infrastructure its operator does
+  not control. A control plane must not expect error text. A node opts in with the
+  `describeHandlerError` option, a function whose result is sent as `description`, cut to 1000
+  characters; the node is then responsible for keeping credentials out of it.
+- **The job is dead-lettered even if that failure cannot be published**, for example when the
+  config has no `nodeId` or the broker refuses the event: requeueing it would restart the loop.
+  The consumer's `health()` then reports `failureReportErrors` and `lastFailureReportError`.
+- **A handler that settles the job itself keeps its outcome.** If it acks or nacks before it
+  throws, the consumer does nothing more. A handler's own `nack(delivery, { requeue: true })`
+  counts toward the next `deliveryAttempt` but is not limited by `maxDeliveryAttempts`; such a
+  handler should check `deliveryAttempt` itself.
+- **A new attempt starts over.** The control plane retries a job as a new message with a new
+  `attemptId`, whose first delivery is attempt 1 again.
+- **A job in flight when the node's channel closes is delivered again.** When the connection
+  drops or the broker closes the node's consumer channel, the broker returns every job left
+  unacked on that channel to the queue and delivers it again, marked redelivered, so it is at
+  least attempt 2. The handler run that still holds it cannot settle it: its delivery tag belonged
+  to the closed channel, and on the new one the same tag may name another job. The consumer
+  refuses such an `ack` or `nack` with an `EdgeStaleDeliveryError` and sends nothing. A job whose
+  first run had already published its result therefore runs again, so a control plane
+  deduplicates outcomes by `jobId` and `attemptId` (see
+  [Publishing Guarantees](#publishing-guarantees)). The same holds when the broker cancels the
+  node's subscription, for example because its queue was deleted.
+
+The count is kept by the consumer, in memory, because the broker does not keep it: RabbitMQ 4.4
+sets no `x-delivery-count` when a job is rejected with `requeue: true`, on classic or quorum
+queues, and classic queues never set it. A quorum queue does count a delivery whose channel closed
+while it was unacked, which is what happens when the node process crashes mid-job; the consumer
+adds that count, and the queue's `x-delivery-limit` dead-letters a job that keeps crashing the
+node (reason `delivery_limit`), a case the consumer cannot catch. Declare node queues as quorum
+queues with a small `x-delivery-limit`, such as 5, for that protection.
 
 ## Timestamp Format
 
@@ -474,6 +526,28 @@ Rules:
 character outside `a-z 0-9 - _` replaced by `-`. Site `Site A` and node `node.1` become `site-a`
 and `node-1`. Permission patterns (below) must use the sanitized form.
 
+## Publishing Guarantees
+
+A node publishes every event as a persistent message on a confirm channel, and a publish
+resolves only once the broker confirms it. For a persistent message routed to durable queues,
+RabbitMQ confirms after every one of those queues has taken it. A publish rejects with an
+`EdgePublishError` when the broker nacks the event (`reason: 'nacked'`), when the channel closes
+before the confirm (`'channel-closed'`), or when no confirm arrives within `confirmTimeoutMs`
+(`'timeout'`).
+
+- **A node acks a job only after the events that report it are confirmed.** Publish the result
+  (or failure), await it, then ack. If the publish rejects, do not ack: the job is redelivered, or
+  dead-lettered after its last attempt (see [Delivery Attempts](#delivery-attempts)), instead of
+  being acked with an outcome the control plane never received.
+- **A rejected publish may still have been delivered.** A nack means the broker did not take
+  responsibility for the event everywhere it was routed; with several queues bound, some may
+  have it. A timeout or a closed channel leaves the same doubt. A node that publishes again
+  produces a duplicate, so a consumer of `mcp.edge.events` deduplicates by `messageId`, and by
+  `jobId` and `attemptId` for outcomes.
+- **An event no binding matches is confirmed and dropped.** The library does not publish with
+  `mandatory`, so the platform binds its event queues before any node starts (see
+  [Broker Topology](#broker-topology)).
+
 ## Broker Topology
 
 The control plane owns the broker topology. Edge nodes run in networks the control plane does not
@@ -495,7 +569,7 @@ Per node:
 
 | Entity | Declaration |
 |:---|:---|
-| queue `mcp.edge.consumer.<siteId>.<nodeId>` | durable (classic or quorum), argument `x-dead-letter-exchange: mcp.edge.dlx` |
+| queue `mcp.edge.consumer.<siteId>.<nodeId>` | durable (quorum recommended, with `x-delivery-limit`; see [Delivery Attempts](#delivery-attempts)), argument `x-dead-letter-exchange: mcp.edge.dlx` |
 | its bindings on `mcp.edge.jobs` | `edge.job.<siteId>.<nodeId>.*.*`, `edge.job.<siteId>.any.*.*`, `edge.job.any.<nodeId>.*.*`, `edge.job.any.any.*.*` |
 | a broker user for the node | with the permissions below |
 
@@ -504,23 +578,61 @@ A node in a group (`nodeGroup`) also binds `edge.job.<siteId>.<nodeGroup>.*.*` a
 queue name and binding keys from a node's config, so a control plane written in TypeScript can
 reuse them.
 
-Dead-lettering: a node rejects a job it cannot parse or validate with `requeue: false`, and the
-broker moves it to `mcp.edge.dlx` with its original routing key; the node needs no permission for
-this. Without a queue bound to `mcp.edge.dlx`, rejected jobs are dropped. Jobs addressed to `any`
-keep `any` in their routing key, so bind the dead-letter queue with `#`, or set
-`x-dead-letter-routing-key` on each node queue if dead letters must be told apart by node.
+Jobs a node rejects go to the dead-letter queue, which the platform declares; see
+[Dead-Letter Queue](#dead-letter-queue).
 
 A node in passive mode checks, with passive declares, that its queue and `mcp.edge.events` exist,
-once at startup and again once after each reconnect. If either is missing, startup fails with an
-`EdgeTopologyError` naming it, and nothing is created. A consumer whose queue has gone after a
-reconnect stops, and its `health()` reports `consumerActive: false` with the reason in
-`details.topologyError`. A node does not check `mcp.edge.jobs` or `mcp.edge.dlx`: it holds no
+once at startup and again once after each reconnect. The consumer also checks its queue again
+before it subscribes on a channel reopened after the broker closed one, or after the broker
+cancelled its subscription; the publisher checks the exchange again after its channel is
+reopened. If either is missing at startup, startup fails with an `EdgeTopologyError` naming it,
+and nothing is created. A consumer that finds its queue gone later stops, and its `health()`
+reports `consumerActive: false` with the reason in `details.topologyError`. A node does not check `mcp.edge.jobs` or `mcp.edge.dlx`: it holds no
 permission on them, and RabbitMQ 4 refuses a passive declare from a user with no permission on the
 name.
 
 The default `topologyMode: 'declare'` declares all of the above for the node itself (except the
 dead-letter queue and the node user), which needs the configure permission. It is meant for local
 development against a broker you own.
+
+### Dead-Letter Queue
+
+**The platform owns the dead-letter queue.** The control plane, or the operator when
+self-hosting, declares it and binds it to `mcp.edge.dlx` before any node starts, and monitors its
+depth. The library never declares or binds it, in either topology mode: declaring a queue needs the
+configure permission, which a node does not have. In declare mode, which is for local development,
+the library declares `mcp.edge.dlx` and points the node queue at it, but binds no queue to it, so
+rejected jobs are dropped unless you bind one yourself.
+
+What a self-hosting operator declares:
+
+| Entity | Declaration |
+|:---|:---|
+| exchange `mcp.edge.dlx` | topic, durable |
+| a queue such as `mcp.edge.dlq` | durable (quorum recommended), bound to `mcp.edge.dlx` with `#` |
+| on every node queue | the argument `x-dead-letter-exchange: mcp.edge.dlx` |
+
+A node rejects a job with `requeue: false`, and the broker moves it to `mcp.edge.dlx`; the node
+needs no permission on the exchange or the queue for this. A job is dead-lettered when it:
+
+- is larger than the node's `maxMessageSizeBytes`;
+- is not JSON, fails envelope validation, or is not an `execution.job`;
+- fails the compatibility check (`compatibility.minConsumerVersion`);
+- made the node's handler throw on its last delivery attempt; the node first publishes an
+  `execution.failure` with code `DELIVERY_ATTEMPTS_EXHAUSTED` (see
+  [Delivery Attempts](#delivery-attempts));
+- is rejected by the node's handler with `nack(delivery, { requeue: false })`;
+- reached a quorum queue's `x-delivery-limit`; the `x-death` reason is then `delivery_limit`.
+
+The broker keeps the job's routing key and adds an `x-death` header naming the node queue, the
+reason (`rejected`) and the count. Jobs addressed to `any` keep `any` in their routing key, so bind
+the dead-letter queue with `#`, or set `x-dead-letter-routing-key` on each node queue if dead
+letters must be told apart by node. Without a queue bound to `mcp.edge.dlx`, the broker drops
+dead-lettered jobs silently, which is why the platform declares it before any node starts.
+
+Bound the queue's growth with a policy (for example `max-length` or `message-ttl`), and alert on
+its depth: a job in it was never run to completion, and for the first three cases and the last
+case above the node published no event about it.
 
 ## Least-Privilege Permissions
 

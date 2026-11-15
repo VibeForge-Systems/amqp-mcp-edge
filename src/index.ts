@@ -18,6 +18,7 @@ export {
   checkEventIdentity,
   defaultAmqpUsername,
   defaultExchangeConfig,
+  defaultMaxDeliveryAttempts,
   defaultQueueNamingStrategy,
   defaultRoutingKeyStrategy,
   eventRoutingTypes,
@@ -95,12 +96,13 @@ export {
   validateEnvelope,
 } from './contracts/index.js';
 
-export type { EdgeJobHandler, JobDeliveryContext } from './consumer/index.js';
-export { EdgeJobConsumer } from './consumer/index.js';
-export { EdgeEventPublisher } from './publisher/index.js';
+export type { EdgeJobConsumerOptions, EdgeJobHandler, JobDeliveryContext } from './consumer/index.js';
+export { EdgeJobConsumer, EdgeStaleDeliveryError, maxHandlerErrorDescriptionLength } from './consumer/index.js';
+export { EdgeEventPublisher, EdgePublishError } from './publisher/index.js';
 
 export type { EdgeChannel } from './connection/index.js';
 export { createEdgeChannel, EdgeChannelConnectionManager } from './connection/index.js';
+export type { EdgeChannelKind } from './connection/index.js';
 
 export type { EdgeChannelHealth } from './health/index.js';
 export { createHealthSnapshot } from './health/index.js';

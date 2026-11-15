@@ -68,8 +68,8 @@ share a broker.
 | **Typed contracts** | Versioned envelopes for jobs, acks, progress, results and failures |
 | **Runtime validation** | Inbound and outbound envelopes are validated at the boundary |
 | **Compatibility checks** | Rejects jobs whose `minConsumerVersion` the worker does not meet |
-| **Consumer primitive** | Job consumer that declares and binds its queue, or in passive mode only checks it, and re-subscribes after a connection drop |
-| **Publisher primitive** | Event publisher that waits for channel drain under backpressure |
+| **Consumer primitive** | Job consumer that declares and binds its queue, or in passive mode only checks it, and subscribes again after a reconnect, a channel the broker closed, or a subscription the broker cancelled |
+| **Publisher primitive** | Event publisher on a confirm channel: each publish resolves once the broker confirms the event, and waits for channel drain under backpressure |
 | **Node identity** | Every event carries the broker-validated AMQP `user_id` of the node, and `checkEventIdentity` checks it on the control-plane side |
 | **Node lifecycle** | `node.hello` and `node.heartbeat` events with a capability snapshot (installed packages, runtimes, library version) and its digest |
 | **Job conventions** | Typed deploy jobs (`package.install`: release, signed URL, expected dist hash) and tool jobs, with standard failure codes |
@@ -157,20 +157,24 @@ await channel.consumer.start();
 | `nodeGroup` | — | Group whose jobs the node also takes |
 | `jobsExchange` | `mcp.edge.jobs` | Exchange jobs arrive on |
 | `eventsExchange` | `mcp.edge.events` | Exchange events are published to |
-| `deadLetterExchange` | `mcp.edge.dlx` | The consumer queue's `x-dead-letter-exchange`, in declare mode |
+| `deadLetterExchange` | `mcp.edge.dlx` | The consumer queue's `x-dead-letter-exchange`, in declare mode. The library binds no queue to it; the platform declares the dead-letter queue |
 | `consumerQueueName` | `mcp.edge.consumer.<siteId>.<nodeId>` | The queue the node consumes |
 | `queueNamingStrategy` | built in | Computes the queue name when `consumerQueueName` is not set |
 | `consumerQueueOptions` | `{ durable: true }` | Queue declaration options, in declare mode; ignored in passive mode |
 | `consumerTag` | assigned by the broker | Consumer tag for the subscription |
 | `prefetchCount` | `1` | Unacknowledged jobs the broker delivers at a time |
+| `maxDeliveryAttempts` | `2` | Deliveries of a job whose handler throws, the first included. After the last, the consumer publishes `execution.failure` (`DELIVERY_ATTEMPTS_EXHAUSTED`, `retryable: false`) and dead-letters the job |
+| `describeHandlerError` | — | Opt-in. That failure carries only the code `HANDLER_ERROR` and the error's class name, never the handler's message; set this to send a description, cut to 1000 characters. Keep credentials out of what it returns |
+| `producer` | this library's name and version | The `producer` of events the library publishes itself, such as that failure |
 | `maxMessageSizeBytes` | `1048576` | Larger jobs are rejected without requeue |
 | `runtimeConsumerVersion` | — | Checked against a job's `compatibility.minConsumerVersion` |
 | `runtimeProducerVersion` | — | Checked against an event's `compatibility.minProducerVersion` |
 | `connectionName` | `amqp-mcp-edge` | Connection name shown by the broker |
-| `reconnectEnabled` | `true` | Reconnect after the connection drops |
-| `reconnectDelayMs` | `1000` | First reconnect delay; doubles after each failed attempt |
+| `reconnectEnabled` | `true` | Reconnect after the connection drops, and reopen a channel the broker closes while the connection stays up. With `false`, either is reopened only when next used |
+| `reconnectDelayMs` | `1000` | First reconnect delay; doubles after each failed attempt. Also the first delay before reopening a channel that closes again within `reconnectMaxDelayMs` |
 | `reconnectMaxDelayMs` | `30000` | Upper bound of the reconnect delay |
 | `backpressureTimeoutMs` | `5000` | How long a publish waits for the channel to drain |
+| `confirmTimeoutMs` | `10000` | How long a publish waits for the broker's confirm. Every publish resolves only once the broker confirms the event, and rejects with an `EdgePublishError` if it nacks it, the channel closes first, or this time passes |
 | `routingKeyStrategy` | — | Accepted, but not applied yet: events use the default routing keys |
 
 ### Production settings
@@ -201,10 +205,40 @@ const channel = await createEdgeChannel({
   broker refuses an event whose `user_id` is not the authenticated user. Consumers of
   `mcp.edge.events` must reject events that lack it
   ([Node identity](docs/PROTOCOL.md#node-identity)).
+- **The platform declares the dead-letter queue.** It binds a queue to `mcp.edge.dlx` before any
+  node starts and watches its depth; the library never declares it, in either mode. Without it,
+  rejected jobs are dropped ([Dead-letter queue](docs/PROTOCOL.md#dead-letter-queue)).
 - **`amqps://`** for any broker not on the same host or a trusted private network.
 
 `'declare'` remains the default in 0.x, for backward compatibility and local development against
 a broker you own.
+
+### Reconnects, channel closes and health
+
+- **A dropped connection** is reopened with backoff. Both channels are new: the consumer
+  subscribes again, in passive mode after checking its queue.
+- **A channel the broker closes** while the connection stays up, for example with
+  `PRECONDITION_FAILED`, is reopened on the same connection, and only its component recovers.
+  The consumer subscribes again. The publisher checks the events exchange again before its next
+  publish in passive mode, so a deleted exchange fails with an `EdgeTopologyError`. A channel that
+  keeps closing is reopened after a growing delay.
+- **A subscription the broker cancels**, for example because its queue was deleted, is restored
+  the same way. In passive mode, a consumer whose queue is gone stops, with the reason in
+  `details.topologyError`; it does not retry.
+- **A job in flight belongs to its subscription.** When a channel closes, the broker returns the
+  jobs left unacked on it to the queue and delivers them again, marked redelivered. The handler
+  still holding such a job gets an `EdgeStaleDeliveryError` from `ack` or `nack`, and nothing is
+  sent: on a new channel, the same delivery tag may name another job. Pass the handler's
+  `delivery` unchanged, because its `subscriptionId` tells the two apart. A job that published its
+  result before the close runs again, so the control plane deduplicates outcomes by `jobId` and
+  `attemptId`.
+- **`consumerActive` and `publisherActive`** have the same values in both components' `health()`.
+  The consumer is active while it is subscribed on the open consumer channel. The publisher is
+  active while its latest publish was confirmed and that channel is still open, which is false
+  before the first publish. Both snapshots also carry the connection's `details`: the reconnect
+  state, `consumerChannelReopens`, `publisherChannelReopens` and the last broker error on a
+  channel (`lastChannelError`). The consumer adds `discardedDeliveries`, the deliveries dropped
+  because their subscription ended, and `brokerCancellations`.
 
 ---
 
@@ -344,22 +378,9 @@ console.log(mock.getPublishedEvents());   // inspect published events
 This is a **0.x** library: the envelope contract (`specVersion: '1.0'`) is stable, but the
 runtime still has gaps that matter for production use. They will be closed before 1.0:
 
-- **No publisher confirms.** Events are published on a plain channel, so a broker-side loss after
-  `publish` returns is not detected.
-- **A throwing job handler requeues indefinitely.** There is no retry limit or poison-message
-  handling yet; handle errors inside your handler and `nack` with `requeue: false` for permanent
-  failures.
-- **Declare mode does not bind the dead-letter exchange.** It declares `mcp.edge.dlx` and sets it
-  as the queue's dead-letter exchange, but jobs rejected with `requeue: false` are dropped unless
-  you bind a queue to it. In passive mode the control plane declares that queue
-  ([Broker topology](docs/PROTOCOL.md#broker-topology)).
 - **RabbitMQ 4.x refuses transient non-exclusive queues.** The default consumer queue is durable
   and unaffected. If you pass `consumerQueueOptions` with `durable: false`, also set
   `exclusive: true`; otherwise the broker closes the connection on declare.
-- **Reconnect is connection-level.** Channel-only closures are not handled, and deliveries
-  received before a reconnect cannot be acknowledged afterwards (the broker redelivers them). In
-  passive mode, a consumer whose queue disappeared while it was disconnected stops, and `health()`
-  reports `consumerActive: false` with the reason in `details.topologyError`; it does not retry.
 
 ---
 
@@ -435,6 +456,12 @@ The integration suite covers:
 
 - Full job lifecycle (dispatch → ack → progress → result)
 - Failure + requeue behavior via `nack(..., { requeue: true })`
+- Publisher confirms: an event the broker nacks (a queue with `x-overflow: reject-publish`)
+  rejects the publish with an `EdgePublishError`, and a worker that acks only after its result is
+  confirmed never acks the job
+- A handler that always throws, on a classic and on a quorum queue: the job is delivered
+  `maxDeliveryAttempts` times, reported as `DELIVERY_ATTEMPTS_EXHAUSTED`, and dead-lettered, and
+  the job queued behind it runs
 - Passive topology: a missing queue or events exchange fails startup with an `EdgeTopologyError`,
   creates nothing, and leaves no reconnect loop running
 - Least privilege: a passive-mode worker whose user has configure `^$`, read on its own queue and
@@ -443,8 +470,18 @@ The integration suite covers:
   rebind the topology, are refused with `ACCESS_REFUSED`
 - Every event carries the node's `user_id`, and an event with a forged `user_id` closes the
   channel with `PRECONDITION_FAILED`
-- After the broker drops the connection, a passive consumer whose queue has gone stops and
-  reports why, with no reconnect loop, while the publisher keeps working
+- After the broker drops the connection, a passive consumer whose queue is deleted while it is
+  disconnected stops and reports why, with no reconnect loop, while the publisher keeps working
+- A job in flight when the broker drops the connection is delivered again on the new connection
+  with the same delivery tag: the old handler's `ack` is refused with an `EdgeStaleDeliveryError`
+  and sends nothing, the redelivery is acked, and the next job runs
+- A consumer channel the broker closes (an ack of an unknown delivery tag, `PRECONDITION_FAILED`),
+  twice in a row, is reopened on the same connection, and the job in flight is delivered again
+- A publish to a deleted events exchange closes only the publisher channel: the publish rejects
+  with an `EdgePublishError` (`channel-closed`), the next one with an `EdgeTopologyError`, and
+  publishing resumes on the same connection once the exchange is back
+- A passive consumer whose queue is deleted while it is connected (the broker cancels its
+  subscription) stops and reports why
 
 The least-privilege tests create a vhost and a broker user through the RabbitMQ management API,
 then delete them. By default they use port 15672 on the broker host (the docker compose file
