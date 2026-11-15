@@ -1,23 +1,58 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { ZodError } from 'zod';
 
 import {
+  buildNodeKey,
   buildRoutingKey,
+  canonicalJson,
+  checkEventIdentity,
+  computeCapabilitiesDigest,
+  createCapabilitySnapshot,
   createMockEdgeChannel,
   defaultAmqpUsername,
+  edgeFailureCodes,
+  edgeLibraryName,
+  edgeLibraryVersion,
+  edgeMessageTypes,
+  EdgeConventionError,
   EdgeEventPublisher,
   EdgeJobConsumer,
   EdgeTopologyError,
+  EdgeUnsupportedMessageTypeError,
+  eventRoutingTypes,
+  isPackageInstallJob,
+  isToolJob,
+  packageInstallResultOutputSchema,
+  parseEventRoutingKey,
+  parsePackageInstallJob,
+  parseToolJob,
+  parseToolResultOutput,
   resolveConfig,
   resolveUserId,
+  sanitizeRoutingSegment,
   validateCompatibility,
   validateConfig,
   validateEnvelope,
+  type NodeCapabilitySnapshot,
 } from '../index.js';
-import { createAckMessage, createBaseEnvelope, createExecutionJob, createFailureMessage, createProgressMessage, createResultMessage } from './fixtures.js';
+import {
+  createAckMessage,
+  createBaseEnvelope,
+  createExecutionJob,
+  createFailureMessage,
+  createHeartbeatMessage,
+  createHelloMessage,
+  createPackageInstallJob,
+  createProgressMessage,
+  createResultMessage,
+  createSnapshot,
+  signedDownloadUrl,
+} from './fixtures.js';
 
 // Shaped like the error amqplib rejects a channel RPC with when the broker closes the channel.
 function amqpChannelError(replyCode: number, text: string): Error & { code: number } {
@@ -192,7 +227,7 @@ class FakePublisherChannel extends EventEmitter {
 
   public assertExchangeCalls = 0;
 
-  public readonly published: Array<{ exchange: string; routingKey: string; options: Record<string, unknown> }> = [];
+  public readonly published: Array<{ exchange: string; routingKey: string; content: Buffer; options: Record<string, unknown> }> = [];
 
   public constructor(private readonly accepted: boolean) {
     super();
@@ -202,9 +237,9 @@ class FakePublisherChannel extends EventEmitter {
     this.assertExchangeCalls += 1;
   }
 
-  public publish(exchange: string, routingKey: string, _content: Buffer, options: Record<string, unknown>): boolean {
+  public publish(exchange: string, routingKey: string, content: Buffer, options: Record<string, unknown>): boolean {
     this.publishCalls += 1;
-    this.published.push({ exchange, routingKey, options });
+    this.published.push({ exchange, routingKey, content, options });
     return this.accepted;
   }
 }
@@ -957,4 +992,443 @@ test('mock edge channel records the userId the publisher would send', async () =
 
   assert.equal(channel.getPublishedEvents()[0]?.userId, 'node-1');
   await channel.close();
+});
+
+// --- Contracts: library version ------------------------------------------------------------------
+
+test('edgeLibraryName and edgeLibraryVersion match package.json', () => {
+  const packageJson = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as { name: string; version: string };
+
+  assert.equal(edgeLibraryName, packageJson.name);
+  assert.equal(edgeLibraryVersion, packageJson.version);
+});
+
+// --- Contracts: canonical JSON and the capability digest -----------------------------------------
+
+test('canonicalJson writes RFC 8785 form: sorted members, no whitespace, JSON.stringify strings and numbers', () => {
+  assert.equal(canonicalJson({ b: 1, a: [true, null, 'x'], c: { z: '', y: -0.5 } }), '{"a":[true,null,"x"],"b":1,"c":{"y":-0.5,"z":""}}');
+  // Members sort by UTF-16 code units, so upper case before lower case and "é" after "z".
+  assert.equal(canonicalJson({ z: 1, é: 2, Z: 3, a: 4 }), '{"Z":3,"a":4,"z":1,"é":2}');
+  assert.equal(canonicalJson({ text: 'line\nbreak "quoted" \u0007' }), '{"text":"line\\nbreak \\"quoted\\" \\u0007"}');
+  assert.equal(canonicalJson({ big: 1e21, small: 1e-7, int: 10 }), '{"big":1e+21,"int":10,"small":1e-7}');
+  // Members holding undefined are left out, as JSON.stringify leaves them out.
+  assert.equal(canonicalJson({ kept: 1, dropped: undefined }), '{"kept":1}');
+
+  assert.throws(() => canonicalJson({ n: Number.NaN }), TypeError);
+  assert.throws(() => canonicalJson({ n: Number.POSITIVE_INFINITY }), TypeError);
+  assert.throws(() => canonicalJson([1, undefined]), TypeError);
+  assert.throws(() => canonicalJson({ n: 1n }), TypeError);
+});
+
+// The vector docs/PROTOCOL.md publishes, so an implementation in another language can check itself.
+const digestVectorSnapshot: NodeCapabilitySnapshot = {
+  runtimes: { node: '22.20.0' },
+  packages: [{ releaseId: 'rel-1', packageVersion: '1.2.0', packageId: 'net-tools', distHash: `mcpod-dist-v2:${'0'.repeat(64)}` }],
+  edgeLibrary: { version: '0.1.0', name: '@vibeforge-systems/amqp-mcp-edge' },
+};
+const digestVectorCanonical =
+  '{"edgeLibrary":{"name":"@vibeforge-systems/amqp-mcp-edge","version":"0.1.0"},' +
+  '"packages":[{"distHash":"mcpod-dist-v2:0000000000000000000000000000000000000000000000000000000000000000",' +
+  '"packageId":"net-tools","packageVersion":"1.2.0","releaseId":"rel-1"}],"runtimes":{"node":"22.20.0"}}';
+const digestVector = 'sha256:c50b81fdd0a559330746ba1d3a830ad7f6a2b20b934ec7c90c40951d746530d2';
+
+test('computeCapabilitiesDigest is sha256 over the canonical JSON, matching the published vector', () => {
+  assert.equal(canonicalJson(digestVectorSnapshot), digestVectorCanonical);
+  assert.equal(`sha256:${createHash('sha256').update(digestVectorCanonical, 'utf8').digest('hex')}`, digestVector);
+  assert.equal(computeCapabilitiesDigest(digestVectorSnapshot), digestVector);
+
+  // Member order does not matter; array order and unknown members do.
+  const reordered = JSON.parse(JSON.stringify({ edgeLibrary: digestVectorSnapshot.edgeLibrary, packages: digestVectorSnapshot.packages, runtimes: digestVectorSnapshot.runtimes })) as NodeCapabilitySnapshot;
+  assert.equal(computeCapabilitiesDigest(reordered), digestVector);
+  assert.notEqual(computeCapabilitiesDigest({ ...digestVectorSnapshot, extra: 'x' } as NodeCapabilitySnapshot), digestVector);
+  const second = { packageId: 'a-first', packageVersion: '1.0.0', distHash: `mcpod-dist-v2:${'1'.repeat(64)}` };
+  assert.notEqual(
+    computeCapabilitiesDigest({ ...digestVectorSnapshot, packages: [...digestVectorSnapshot.packages, second] }),
+    computeCapabilitiesDigest({ ...digestVectorSnapshot, packages: [second, ...digestVectorSnapshot.packages] }),
+  );
+});
+
+test('createCapabilitySnapshot names this library and Node.js, and sorts packages so the digest is stable', () => {
+  const later = { packageId: 'net-tools', packageVersion: '1.10.0', distHash: `mcpod-dist-v2:${'b'.repeat(64)}` };
+  const earlier = { packageId: 'net-tools', packageVersion: '1.0.0', distHash: `mcpod-dist-v2:${'c'.repeat(64)}` };
+  const other = { packageId: 'alpha', packageVersion: '2.0.0', releaseId: 'rel-alpha', distHash: `mcpod-dist-v2:${'d'.repeat(64)}` };
+
+  const snapshot = createCapabilitySnapshot({ packages: [later, other, earlier], runtimes: { python: '3.12.4' } });
+
+  assert.deepEqual(snapshot.edgeLibrary, { name: edgeLibraryName, version: edgeLibraryVersion });
+  assert.deepEqual(snapshot.runtimes, { node: process.versions.node, python: '3.12.4' });
+  // Sorted by packageId, then packageVersion as a string.
+  assert.deepEqual(snapshot.packages.map((item) => `${item.packageId}@${item.packageVersion}`), ['alpha@2.0.0', 'net-tools@1.0.0', 'net-tools@1.10.0']);
+  assert.equal(
+    computeCapabilitiesDigest(createCapabilitySnapshot({ packages: [earlier, later, other], runtimes: { python: '3.12.4' } })),
+    computeCapabilitiesDigest(snapshot),
+  );
+  // An explicit runtime wins over the detected one, and the input array is not reordered.
+  assert.equal(createCapabilitySnapshot({ runtimes: { node: '24.0.0' } }).runtimes.node, '24.0.0');
+  assert.deepEqual(createCapabilitySnapshot().packages, []);
+});
+
+// --- Contracts: node.hello and node.heartbeat ----------------------------------------------------
+
+test('validateEnvelope accepts node.hello and node.heartbeat, with or without the snapshot on a heartbeat', () => {
+  assert.equal(validateEnvelope(createHelloMessage()).messageType, 'node.hello');
+  assert.equal(validateEnvelope(createHeartbeatMessage()).messageType, 'node.heartbeat');
+
+  const changed = createSnapshot({ packages: [] });
+  const withSnapshot = createHeartbeatMessage({
+    payload: { ...createHeartbeatMessage().payload, capabilities: changed, capabilitiesDigest: computeCapabilitiesDigest(changed) },
+  });
+  assert.equal(validateEnvelope(withSnapshot).messageType, 'node.heartbeat');
+  assert.deepEqual(edgeMessageTypes.filter((type) => type.startsWith('node.')), ['node.hello', 'node.heartbeat']);
+});
+
+test('a lifecycle message whose digest does not match the snapshot it carries is rejected', () => {
+  const hello = createHelloMessage();
+  const stale = { ...hello, payload: { ...hello.payload, capabilitiesDigest: computeCapabilitiesDigest(createSnapshot({ packages: [] })) } };
+  assert.throws(() => validateEnvelope(stale), /^Error: invalid node\.hello envelope: .*capabilitiesDigest.*does not match capabilities/s);
+
+  const heartbeat = createHeartbeatMessage();
+  const mismatched = { ...heartbeat, payload: { ...heartbeat.payload, capabilities: createSnapshot({ packages: [] }) } };
+  assert.throws(() => validateEnvelope(mismatched), /^Error: invalid node\.heartbeat envelope: .*does not match capabilities/s);
+
+  // Unknown snapshot members are covered by the digest: adding one without recomputing fails.
+  const extended = { ...hello, payload: { ...hello.payload, capabilities: { ...hello.payload.capabilities, gpu: 'none' } } };
+  assert.throws(() => validateEnvelope(extended), /does not match capabilities/);
+  const recomputed = { ...extended, payload: { ...extended.payload, capabilitiesDigest: computeCapabilitiesDigest(extended.payload.capabilities) } };
+  assert.equal(validateEnvelope(recomputed).messageType, 'node.hello');
+});
+
+test('node lifecycle payloads reject missing identity, bad counters, bad digests and bad snapshots', () => {
+  const hello = createHelloMessage();
+  const helloWith = (payload: Record<string, unknown>) => ({ ...hello, payload: { ...hello.payload, ...payload } });
+  const snapshotWith = (snapshot: Record<string, unknown>) => {
+    const capabilities = { ...createSnapshot(), ...snapshot } as NodeCapabilitySnapshot;
+    return helloWith({ capabilities, capabilitiesDigest: computeCapabilitiesDigest(capabilities) });
+  };
+
+  const rejected: Array<[label: string, message: unknown]> = [
+    ['no siteId', helloWith({ siteId: undefined })],
+    ['no nodeId', helloWith({ nodeId: undefined })],
+    ['no sessionId', helloWith({ sessionId: '' })],
+    ['sequence 0', helloWith({ sequence: 0 })],
+    ['fractional sequence', helloWith({ sequence: 1.5 })],
+    ['heartbeatIntervalMs 0', helloWith({ heartbeatIntervalMs: 0 })],
+    ['no startedAt', helloWith({ startedAt: undefined })],
+    ['minute-precision startedAt', helloWith({ startedAt: '2026-11-14T10:00Z' })],
+    ['no capabilities on hello', helloWith({ capabilities: undefined })],
+    ['upper-case digest', helloWith({ capabilitiesDigest: hello.payload.capabilitiesDigest.toUpperCase() })],
+    ['digest without its tag', helloWith({ capabilitiesDigest: hello.payload.capabilitiesDigest.slice('sha256:'.length) })],
+    ['empty runtimes', snapshotWith({ runtimes: {} })],
+    ['no edgeLibrary', snapshotWith({ edgeLibrary: undefined })],
+    ['dist hash with upper-case hex', snapshotWith({ packages: [{ packageId: 'p', packageVersion: '1', distHash: `mcpod-dist-v2:${'A'.repeat(64)}` }] })],
+    ['dist hash without a tag', snapshotWith({ packages: [{ packageId: 'p', packageVersion: '1', distHash: 'a'.repeat(64) }] })],
+    ['dist hash of 63 digits', snapshotWith({ packages: [{ packageId: 'p', packageVersion: '1', distHash: `sha256:${'a'.repeat(63)}` }] })],
+    ['package without a version', snapshotWith({ packages: [{ packageId: 'p', distHash: `sha256:${'a'.repeat(64)}` }] })],
+  ];
+
+  for (const [label, message] of rejected) {
+    assert.throws(() => validateEnvelope(message), /^Error: invalid node\.hello envelope: /, label);
+  }
+
+  const heartbeat = createHeartbeatMessage();
+  assert.throws(() => validateEnvelope({ ...heartbeat, payload: { ...heartbeat.payload, siteId: undefined } }), /invalid node\.heartbeat envelope/);
+  assert.throws(() => validateEnvelope({ ...heartbeat, payload: { ...heartbeat.payload, capabilitiesDigest: undefined } }), /invalid node\.heartbeat envelope/);
+
+  // Additive members are accepted, as the compatibility rules require.
+  assert.equal(validateEnvelope(helloWith({ futureField: { any: 'thing' } })).messageType, 'node.hello');
+  // A 128-digit dist hash (a SHA-512-based format) is accepted.
+  assert.equal(validateEnvelope(snapshotWith({ packages: [{ packageId: 'p', packageVersion: '1', distHash: `x-v1:${'e'.repeat(128)}` }] })).messageType, 'node.hello');
+});
+
+test('an unknown messageType raises EdgeUnsupportedMessageTypeError, so consumers can ignore it', () => {
+  assert.throws(
+    () => validateEnvelope({ ...createHelloMessage(), messageType: 'node.control' }),
+    (error: unknown) => {
+      assert.ok(error instanceof EdgeUnsupportedMessageTypeError);
+      assert.ok(error instanceof Error);
+      assert.equal(error.messageType, 'node.control');
+      assert.equal(error.message, 'unsupported messageType: node.control');
+      return true;
+    },
+  );
+  // A known type that fails its schema is a plain validation error, not an unsupported type.
+  assert.throws(
+    () => validateEnvelope({ ...createHelloMessage(), payload: {} }),
+    (error: unknown) => !(error instanceof EdgeUnsupportedMessageTypeError) && /^invalid node\.hello envelope: /.test((error as Error).message),
+  );
+});
+
+// --- Contracts: routing and node identity --------------------------------------------------------
+
+test('node lifecycle events route as edge.event.hello and edge.event.heartbeat, inside the node topic permission', () => {
+  assert.equal(buildRoutingKey('node.hello', { siteId: 'Site A', nodeId: 'node.1' }), 'edge.event.hello.site-a.node-1');
+  assert.equal(buildRoutingKey('node.heartbeat', { siteId: 'site-a', nodeId: 'node-1' }), 'edge.event.heartbeat.site-a.node-1');
+
+  // The topic write permission docs/PROTOCOL.md gives a node already covers both.
+  const topicWrite = /^edge\.event\.[a-z]+\.site-a\.node-1$/;
+  for (const messageType of edgeMessageTypes.filter((type) => type !== 'execution.job')) {
+    assert.match(buildRoutingKey(messageType, { siteId: 'site-a', nodeId: 'node-1' }), topicWrite, messageType);
+  }
+});
+
+test('parseEventRoutingKey splits every event routing key and refuses anything else', () => {
+  for (const [eventType, messageType] of Object.entries(eventRoutingTypes)) {
+    const routingKey = buildRoutingKey(messageType, { siteId: 'site-a', nodeId: 'node-1' });
+    assert.deepEqual(parseEventRoutingKey(routingKey), { eventType, messageType, siteId: 'site-a', nodeId: 'node-1' });
+  }
+
+  for (const routingKey of [
+    'edge.job.site-a.node-1.tool.search-documents',
+    'edge.event.control.site-a.node-1',
+    'edge.event.hello.site-a',
+    'edge.event.hello.site-a.node-1.extra',
+    'edge.event.hello..node-1',
+    'edge.event.constructor.site-a.node-1',
+    '',
+  ]) {
+    assert.equal(parseEventRoutingKey(routingKey), undefined, routingKey);
+  }
+});
+
+test('buildNodeKey and sanitizeRoutingSegment give the form routing keys and queue names use', () => {
+  assert.equal(buildNodeKey({ siteId: 'Site A', nodeId: 'node.1' }), 'site-a.node-1');
+  assert.equal(sanitizeRoutingSegment(' Edge_Node-7 '), 'edge_node-7');
+  assert.equal(sanitizeRoutingSegment(undefined), 'any');
+});
+
+test('checkEventIdentity accepts the provisioned node and names each mismatch', () => {
+  const provisioned = { userId: 'node-1@site-a', siteId: 'site-a', nodeId: 'node-1' };
+  const hello = createHelloMessage();
+  const routingKey = 'edge.event.hello.site-a.node-1';
+
+  assert.deepEqual(checkEventIdentity({ routingKey, userId: 'node-1@site-a', envelope: hello }, provisioned), []);
+  assert.deepEqual(checkEventIdentity({ routingKey: 'edge.event.result.site-a.node-1', userId: 'node-1@site-a', envelope: createResultMessage() }, provisioned), []);
+
+  const reasons = (event: Parameters<typeof checkEventIdentity>[0]) => checkEventIdentity(event, provisioned).join(' | ');
+
+  assert.match(reasons({ routingKey, userId: undefined, envelope: hello }), /has no user_id/);
+  assert.match(reasons({ routingKey, userId: 'node-2@site-a', envelope: hello }), /user_id 'node-2@site-a' is not the provisioned user/);
+  assert.match(reasons({ routingKey: 'edge.event.hello.site-a.node-2', userId: 'node-1@site-a', envelope: hello }), /routing key 'edge\.event\.hello\.site-a\.node-2' is not 'edge\.event\.hello\.site-a\.node-1'/);
+  // A routing key of another event type is a mismatch too.
+  assert.match(reasons({ routingKey: 'edge.event.heartbeat.site-a.node-1', userId: 'node-1@site-a', envelope: hello }), /routing key/);
+  assert.match(
+    reasons({ routingKey, userId: 'node-1@site-a', envelope: { ...hello, payload: { ...hello.payload, nodeId: 'node-2' } } }),
+    /payload\.nodeId 'node-2' is not the provisioned node/,
+  );
+  assert.match(
+    reasons({ routingKey, userId: 'node-1@site-a', envelope: { ...hello, payload: { ...hello.payload, siteId: 'site-b' } } }),
+    /payload\.siteId 'site-b' is not the provisioned site/,
+  );
+  assert.match(reasons({ routingKey, userId: 'node-1@site-a', envelope: createExecutionJob() }), /execution\.job is not an event/);
+});
+
+// --- Contracts: publishing and consuming lifecycle messages --------------------------------------
+
+test('publisher sends node.hello and node.heartbeat to the events exchange with the node routing keys and user_id', async () => {
+  const channel = new FakePublisherChannel(true);
+  const publisher = new EdgeEventPublisher(
+    { amqpUrl: 'amqps://node-1%40site-a:secret@broker.example.com', siteId: 'site-a', nodeId: 'node-1' },
+    new FakePublisherConnectionManager(channel) as never,
+  );
+
+  await publisher.publishNodeHello(createHelloMessage());
+  await publisher.publishNodeHeartbeat(createHeartbeatMessage());
+
+  assert.deepEqual(
+    channel.published.map(({ exchange, routingKey, options }) => [exchange, routingKey, options.type, options.userId]),
+    [
+      ['mcp.edge.events', 'edge.event.hello.site-a.node-1', 'node.hello', 'node-1@site-a'],
+      ['mcp.edge.events', 'edge.event.heartbeat.site-a.node-1', 'node.heartbeat', 'node-1@site-a'],
+    ],
+  );
+  assert.equal(validateEnvelope(JSON.parse(channel.published[0]!.content.toString('utf8'))).messageType, 'node.hello');
+});
+
+test('publisher refuses a lifecycle message whose digest does not match, before publishing', async () => {
+  const channel = new FakePublisherChannel(true);
+  const publisher = new EdgeEventPublisher({ amqpUrl: 'amqp://node-1:secret@broker.example.com' }, new FakePublisherConnectionManager(channel) as never);
+  const hello = createHelloMessage();
+
+  await assert.rejects(
+    () => publisher.publishNodeHello({ ...hello, payload: { ...hello.payload, capabilitiesDigest: `sha256:${'0'.repeat(64)}` } }),
+    /invalid node\.hello envelope/,
+  );
+  assert.equal(channel.publishCalls, 0);
+});
+
+test('mock edge channel records node lifecycle events', async () => {
+  const channel = createMockEdgeChannel({ amqpUrl: 'amqp://node-1:secret@broker.example.com', siteId: 'site-a', nodeId: 'node-1' });
+
+  await channel.publisher.publishNodeHello(createHelloMessage());
+  await channel.publisher.publishNodeHeartbeat(createHeartbeatMessage());
+
+  assert.deepEqual(
+    channel.getPublishedEvents().map((event) => [event.routingKey, event.message.messageType, event.userId]),
+    [
+      ['edge.event.hello.site-a.node-1', 'node.hello', 'node-1'],
+      ['edge.event.heartbeat.site-a.node-1', 'node.heartbeat', 'node-1'],
+    ],
+  );
+  await channel.close();
+});
+
+test('a lifecycle message delivered on a job queue is rejected without requeue and never reaches the handler', async () => {
+  const channel = new FakeConsumerChannel();
+  const consumer = new EdgeJobConsumer(
+    { amqpUrl: 'amqp://test.local', siteId: 'site-a', nodeId: 'node-1', runtimeConsumerVersion: '0.1.0' },
+    new FakeConsumerConnectionManager(channel) as never,
+  );
+  let handled = false;
+  consumer.onJob(async () => {
+    handled = true;
+  });
+  await consumer.start();
+
+  channel.emitMessage({
+    fields: { deliveryTag: 7, routingKey: 'edge.job.site-a.node-1.task.package-install', redelivered: false },
+    content: Buffer.from(JSON.stringify(createHelloMessage()), 'utf8'),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(handled, false);
+  assert.equal(channel.nackCount, 1);
+  assert.equal(channel.lastNackDeliveryTag, 7);
+  await consumer.stop();
+});
+
+// --- Conventions: deploy jobs (package.install) --------------------------------------------------
+
+test('parsePackageInstallJob returns the release, the signed URL and the expected dist hash', () => {
+  const job = createPackageInstallJob();
+  assert.equal(validateEnvelope(job).messageType, 'execution.job');
+  assert.equal(isPackageInstallJob(job), true);
+  assert.equal(isToolJob(job), false);
+
+  const parsed = parsePackageInstallJob(job);
+  assert.equal(parsed.job, job);
+  assert.deepEqual(parsed.release, { packageId: 'net-tools', packageVersion: '1.2.0', releaseId: 'rel-net-tools-1.2.0' });
+  assert.deepEqual(parsed.download, { url: signedDownloadUrl, expiresAt: '2026-11-15T10:00:00Z' });
+  assert.equal(parsed.distHash, `mcpod-dist-v2:${'a'.repeat(64)}`);
+
+  // expiresAt is optional, and a packageAssignment naming the same release is accepted.
+  const minimal = createPackageInstallJob({ download: { url: signedDownloadUrl } });
+  assert.equal(parsePackageInstallJob(minimal).download.expiresAt, undefined);
+  for (const packageAssignment of [
+    { packageId: 'net-tools', packageVersion: '1.2.0', releaseId: 'rel-net-tools-1.2.0' },
+    { packageId: 'net-tools', packageVersion: '1.2.0' },
+  ]) {
+    assert.deepEqual(parsePackageInstallJob({ ...job, payload: { ...job.payload, packageAssignment } }).release, parsed.release);
+  }
+});
+
+test('parsePackageInstallJob refuses every way a deploy job can be malformed, without echoing the URL', () => {
+  const cases: Array<[label: string, job: ReturnType<typeof createPackageInstallJob>, issue: RegExp]> = [
+    ['http URL', createPackageInstallJob({ download: { url: signedDownloadUrl.replace('https:', 'http:') } }), /input\.download\.url: must be an absolute https URL/],
+    ['relative URL', createPackageInstallJob({ download: { url: '/releases/net-tools.tgz' } }), /input\.download\.url/],
+    ['URL with credentials', createPackageInstallJob({ download: { url: 'https://user:pass@packages.example.com/net-tools.tgz' } }), /must not carry a username or password/],
+    ['no download', createPackageInstallJob({ download: undefined }), /input\.download/],
+    ['bad expiresAt', createPackageInstallJob({ download: { url: signedDownloadUrl, expiresAt: '2026-11-15T10:00Z' } }), /input\.download\.expiresAt/],
+    ['no dist hash', createPackageInstallJob({ distHash: undefined }), /input\.distHash/],
+    ['upper-case dist hash', createPackageInstallJob({ distHash: `mcpod-dist-v2:${'A'.repeat(64)}` }), /input\.distHash: must be an algorithm tag/],
+    ['dist hash with whitespace', createPackageInstallJob({ distHash: ` mcpod-dist-v2:${'a'.repeat(64)}` }), /input\.distHash/],
+    ['no releaseId', createPackageInstallJob({ release: { packageId: 'net-tools', packageVersion: '1.2.0' } }), /input\.release\.releaseId/],
+    [
+      'packageAssignment of another release',
+      createPackageInstallJob({}, { payload: { ...createPackageInstallJob().payload, packageAssignment: { packageId: 'net-tools', packageVersion: '1.1.0' } } }),
+      /packageAssignment: names another release/,
+    ],
+    [
+      'packageAssignment with another releaseId',
+      createPackageInstallJob({}, { payload: { ...createPackageInstallJob().payload, packageAssignment: { packageId: 'net-tools', packageVersion: '1.2.0', releaseId: 'rel-other' } } }),
+      /packageAssignment\.releaseId: differs/,
+    ],
+    [
+      'a tool job',
+      { ...createPackageInstallJob(), payload: { ...createPackageInstallJob().payload, capability: { kind: 'tool', name: 'package.install' } } },
+      /capability must be \{kind:'task', name:'package\.install'\}/,
+    ],
+  ];
+
+  for (const [label, job, issue] of cases) {
+    assert.throws(
+      () => parsePackageInstallJob(job),
+      (error: unknown) => {
+        assert.ok(error instanceof EdgeConventionError, label);
+        assert.equal(error.convention, 'package.install', label);
+        assert.match(error.issues.join('; '), issue, label);
+        assert.ok(!error.message.includes('not-a-real-signature'), `${label}: the error echoes the signed URL`);
+        return true;
+      },
+      label,
+    );
+  }
+});
+
+test('packageInstallResultOutputSchema accepts the deploy result and rejects an incomplete one', () => {
+  const release = { packageId: 'net-tools', packageVersion: '1.2.0', releaseId: 'rel-net-tools-1.2.0' };
+  const distHash = `mcpod-dist-v2:${'a'.repeat(64)}`;
+
+  assert.equal(packageInstallResultOutputSchema.safeParse({ release, distHash, alreadyInstalled: false }).success, true);
+  assert.equal(packageInstallResultOutputSchema.safeParse({ release, distHash }).success, false);
+  assert.equal(packageInstallResultOutputSchema.safeParse({ release: { packageId: 'net-tools' }, distHash, alreadyInstalled: true }).success, false);
+  assert.equal(packageInstallResultOutputSchema.safeParse({ release, distHash: 'not-a-hash', alreadyInstalled: true }).success, false);
+});
+
+// --- Conventions: tool jobs ----------------------------------------------------------------------
+
+test('parseToolJob returns the tool name, its arguments, the timeout and the idempotency key', () => {
+  const job = createExecutionJob();
+  const parsed = parseToolJob(job);
+
+  assert.equal(isToolJob(job), true);
+  assert.equal(isPackageInstallJob(job), false);
+  assert.equal(parsed.name, 'search.documents');
+  assert.equal(parsed.arguments, job.payload.input);
+  assert.equal(parsed.timeoutMs, 30000);
+  assert.equal(parsed.idempotencyKey, 'job-1-attempt-1');
+
+  for (const name of ['getUser', 'DATA_EXPORT_v2', 'admin.tools.list', 'mcp_od_net_ping', 'a'.repeat(128)]) {
+    assert.equal(parseToolJob({ ...job, payload: { ...job.payload, capability: { kind: 'tool', name } } }).name, name);
+  }
+});
+
+test('parseToolJob refuses a non-tool capability and names that break the MCP tool-name rule', () => {
+  const job = createExecutionJob();
+
+  assert.throws(() => parseToolJob(createPackageInstallJob()), (error: unknown) => error instanceof EdgeConventionError && /capability\.kind must be 'tool'/.test(error.message));
+
+  for (const name of ['search documents', 'tool/with/slashes', 'résumé', 'a'.repeat(129), 'comma,name']) {
+    assert.throws(
+      () => parseToolJob({ ...job, payload: { ...job.payload, capability: { kind: 'tool', name } } }),
+      (error: unknown) => error instanceof EdgeConventionError && error.convention === 'tool' && /1 to 128 characters/.test(error.message),
+      name,
+    );
+  }
+});
+
+test('parseToolResultOutput takes a complete MCP CallToolResult and refuses input_required', () => {
+  const content = [{ type: 'text', text: 'pong' }];
+
+  assert.deepEqual(parseToolResultOutput({ content }).content, content);
+  assert.equal(parseToolResultOutput({ content, isError: true }).isError, true);
+  assert.equal(parseToolResultOutput({ content: [], resultType: 'complete', structuredContent: [1, 2] }).resultType, 'complete');
+  // structuredContent may be any JSON value, as MCP 2026-07-28 allows.
+  assert.equal(parseToolResultOutput({ content, structuredContent: 'plain' }).structuredContent, 'plain');
+
+  for (const [label, output] of [
+    ['input_required', { resultType: 'input_required', inputRequests: {}, content }],
+    ['no content', { isError: false }],
+    ['a content block without a type', { content: [{ text: 'pong' }] }],
+    ['isError not a boolean', { content, isError: 'yes' }],
+  ] as const) {
+    assert.throws(() => parseToolResultOutput(output), EdgeConventionError, label);
+  }
+});
+
+test('edgeFailureCodes are distinct upper-case codes', () => {
+  const codes = Object.values(edgeFailureCodes);
+  assert.equal(new Set(codes).size, codes.length);
+  for (const code of codes) {
+    assert.match(code, /^[A-Z][A-Z_]*[A-Z]$/);
+  }
 });

@@ -32,6 +32,35 @@ follows [Semantic Versioning](https://semver.org/). Version 0.1.0 has not been p
 - integration tests that run a passive-mode worker as a least-privilege user, check that it cannot
   delete the shared exchanges, and check that a forged `user_id` is refused; they create the user
   through the management API, which CI now exposes on port 15672
+- **Contract:** node lifecycle messages `node.hello` and `node.heartbeat`, published to
+  `mcp.edge.events` as `edge.event.hello.<siteId>.<nodeId>` and
+  `edge.event.heartbeat.<siteId>.<nodeId>`, which the existing node topic permission already
+  covers. Both carry a session ID, a sequence number and the heartbeat interval; `node.hello`
+  carries a capability snapshot (installed packages with their dist hashes, runtimes, this
+  library's version), and both carry its digest, SHA-256 over the RFC 8785 canonical JSON. The
+  validators reject a message whose digest does not match the snapshot it carries.
+  `publisher.publishNodeHello` and `publisher.publishNodeHeartbeat` publish them, and the mock
+  channel records them
+- `createCapabilitySnapshot`, `computeCapabilitiesDigest` and `canonicalJson`, and
+  `edgeLibraryName` and `edgeLibraryVersion`
+- **Contract:** the deploy-job convention, `capability: { kind: 'task', name: 'package.install' }`
+  with the release identity, a signed `https` download URL and the expected dist hash in `input`;
+  `isPackageInstallJob`, `parsePackageInstallJob` and `packageInstallResultOutputSchema`
+- **Contract:** the tool-job convention, `capability: { kind: 'tool', name }` with the MCP tool
+  name, the tool's arguments as `input`, and an MCP `CallToolResult` as the result output;
+  `isToolJob`, `parseToolJob` and `parseToolResultOutput`. Both conventions throw an
+  `EdgeConventionError` listing every problem
+- `edgeFailureCodes`, the standard `execution.failure` codes, and the reserved `package.*` and
+  `node.*` task names
+- `checkEventIdentity`, which applies the node-identity rules to a delivered event for a control
+  plane, and `parseEventRoutingKey`, `buildNodeKey`, `sanitizeRoutingSegment` and
+  `eventRoutingTypes`
+- `EdgeUnsupportedMessageTypeError`, thrown by `validateEnvelope` for a `messageType` it does not
+  know, so a consumer can ignore such a message, as the compatibility rules now require, instead
+  of rejecting it
+- `docs/PROTOCOL.md` specifies the lifecycle messages and their sending and liveness rules, the
+  capability digest with a test vector, the job conventions, the failure codes, and how a 1.0
+  consumer treats a message type it does not know
 
 ### Changed
 
@@ -49,6 +78,8 @@ follows [Semantic Versioning](https://semver.org/). Version 0.1.0 has not been p
   `payload.attempt.maxAttempts`) must be safe integers, and progress `metrics` values must be
   finite numbers. zod 3 accepted integers above `Number.MAX_SAFE_INTEGER` and `Infinity`. JSON
   cannot carry `Infinity`, so that half affects only events built in process
+- `EdgeEnvelope`, which `validateEnvelope` returns, also includes the two lifecycle messages.
+  TypeScript code that reads `payload.jobId` from it must first narrow on `messageType`
 - validation errors from `validateEnvelope` and `assertCompatibleEnvelope` keep their
   `invalid <messageType> envelope:` prefix, but the issue text after it is now zod 4's (for
   example `invalid_format` and `Invalid ISO datetime` where zod 3 gave `invalid_string` and

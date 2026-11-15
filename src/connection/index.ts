@@ -12,7 +12,13 @@ type EdgeJobConsumerSurface = Pick<
 
 type EdgeEventPublisherSurface = Pick<
   EdgeEventPublisher,
-  'publishAck' | 'publishProgress' | 'publishResult' | 'publishFailure' | 'health'
+  | 'publishAck'
+  | 'publishProgress'
+  | 'publishResult'
+  | 'publishFailure'
+  | 'publishNodeHello'
+  | 'publishNodeHeartbeat'
+  | 'health'
 >;
 
 export interface EdgeChannel {

@@ -70,7 +70,9 @@ share a broker.
 | **Compatibility checks** | Rejects jobs whose `minConsumerVersion` the worker does not meet |
 | **Consumer primitive** | Job consumer that declares and binds its queue, or in passive mode only checks it, and re-subscribes after a connection drop |
 | **Publisher primitive** | Event publisher that waits for channel drain under backpressure |
-| **Node identity** | Every event carries the broker-validated AMQP `user_id` of the node |
+| **Node identity** | Every event carries the broker-validated AMQP `user_id` of the node, and `checkEventIdentity` checks it on the control-plane side |
+| **Node lifecycle** | `node.hello` and `node.heartbeat` events with a capability snapshot (installed packages, runtimes, library version) and its digest |
+| **Job conventions** | Typed deploy jobs (`package.install`: release, signed URL, expected dist hash) and tool jobs, with standard failure codes |
 | **Least privilege** | Passive topology mode: a node runs without the configure permission |
 | **Routing helpers** | Deterministic routing keys and queue names for edge execution traffic |
 | **Health snapshots** | Structured connection and channel health for monitoring endpoints |
@@ -255,6 +257,67 @@ const job: ExecutionJobEnvelope = {
 };
 
 validateEnvelope(job); // throws an Error describing the first invalid field
+```
+
+### Announcing a node
+
+A node sends `node.hello` after each connection and `node.heartbeat` on an interval; the rules are
+in [Node Lifecycle Messages](docs/PROTOCOL.md#node-lifecycle-messages).
+
+```ts
+import { randomUUID } from 'node:crypto';
+import { computeCapabilitiesDigest, createCapabilitySnapshot } from '@vibeforge-systems/amqp-mcp-edge';
+
+const sessionId = randomUUID();
+const startedAt = new Date().toISOString();
+let sequence = 0;
+
+const envelope = () => ({
+  specVersion: '1.0' as const,
+  messageId: randomUUID(),
+  timestamp: new Date().toISOString(),
+  producer: { service: 'edge-worker', version: '0.1.0' },
+  compatibility: { channelVersion: '0.1.0' },
+});
+
+const capabilities = createCapabilitySnapshot({ packages: [] });
+const node = { siteId: 'site-a', nodeId: 'node-1', sessionId, heartbeatIntervalMs: 30_000 };
+
+await channel.publisher.publishNodeHello({
+  ...envelope(),
+  messageType: 'node.hello',
+  payload: { ...node, sequence: ++sequence, startedAt, capabilities, capabilitiesDigest: computeCapabilitiesDigest(capabilities) },
+});
+
+setInterval(() => {
+  void channel.publisher.publishNodeHeartbeat({
+    ...envelope(),
+    messageType: 'node.heartbeat',
+    payload: { ...node, sequence: ++sequence, capabilitiesDigest: computeCapabilitiesDigest(capabilities) },
+  });
+}, node.heartbeatIntervalMs);
+```
+
+### Handling a deploy job
+
+```ts
+import { EdgeConventionError, isPackageInstallJob, parsePackageInstallJob } from '@vibeforge-systems/amqp-mcp-edge';
+
+channel.consumer.onJob(async (job, delivery) => {
+  if (isPackageInstallJob(job)) {
+    try {
+      const { release, download, distHash } = parsePackageInstallJob(job);
+      // Download download.url (a credential: never log it), compute the dist hash over the archive's
+      // contents, compare it with distHash as an exact string, and install only on a match.
+    } catch (error) {
+      if (error instanceof EdgeConventionError) {
+        // Publish execution.failure with code INVALID_INPUT and retryable: false, then ack.
+      }
+    }
+  }
+
+  await channel.consumer.ack(delivery);
+});
 ```
 
 ### Mock channel for tests

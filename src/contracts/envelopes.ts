@@ -6,6 +6,8 @@ export const edgeMessageTypes = [
   'execution.progress',
   'execution.result',
   'execution.failure',
+  'node.hello',
+  'node.heartbeat',
 ] as const;
 
 export type EdgeMessageType = (typeof edgeMessageTypes)[number];
